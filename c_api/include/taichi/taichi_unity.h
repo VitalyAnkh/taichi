@@ -1,6 +1,8 @@
 #pragma once
 
-#include <taichi/taichi.h>
+#ifndef TAICHI_H
+#include "taichi.h"
+#endif  // TAICHI_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -9,8 +11,15 @@ extern "C" {
 // Handle `TixNativeBufferUnity`
 typedef struct TixNativeBufferUnity_t *TixNativeBufferUnity;
 
+// Callback `TixAsyncTaskUnity`
+typedef void(TI_API_CALL *TixAsyncTaskUnity)(void *user_data);
+
 // Function `tix_import_native_runtime_unity`
 TI_DLL_EXPORT TiRuntime TI_API_CALL tix_import_native_runtime_unity();
+
+// Function `tix_enqueue_task_async_unity`
+TI_DLL_EXPORT void TI_API_CALL
+tix_enqueue_task_async_unity(void *user_data, TixAsyncTaskUnity async_task);
 
 // Function `tix_launch_kernel_async_unity`
 TI_DLL_EXPORT void TI_API_CALL

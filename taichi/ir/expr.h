@@ -10,6 +10,7 @@ class Expression;
 class Identifier;
 class ExprGroup;
 class SNode;
+class ASTBuilder;
 
 class Expr {
  public:
@@ -21,6 +22,8 @@ class Expr {
     const_value = false;
     atomic = false;
   }
+
+  explicit Expr(uint1 x);
 
   explicit Expr(int16 x);
 
@@ -82,8 +85,6 @@ class Expr {
   // std::variant<Expr, std::string> in FrontendPrintStmt.
   Expr &operator=(const Expr &o);
 
-  Expr operator[](const ExprGroup &indices) const;
-
   template <typename T, typename... Args>
   static Expr make(Args &&...args) {
     return Expr(std::make_shared<T>(std::forward<Args>(args)...));
@@ -91,8 +92,10 @@ class Expr {
 
   SNode *snode() const;
 
-  // traceback for type checking error message
-  void set_tb(const std::string &tb);
+  // debug info, contains traceback for type checking error message
+  void set_dbg_info(const DebugInfo &dbg_info);
+
+  const std::string &get_tb() const;
 
   void set_adjoint(const Expr &o);
 
@@ -102,7 +105,9 @@ class Expr {
 
   DataType get_ret_type() const;
 
-  void type_check(CompileConfig *config);
+  DataType get_rvalue_type() const;
+
+  void type_check(const CompileConfig *config);
 };
 
 // Value cast
@@ -133,28 +138,15 @@ Expr expr_rand() {
   return taichi::lang::expr_rand(get_data_type<T>());
 }
 
-/*
- * This function allocates the space for a new item (a struct or a scalar)
- * in the Dynamic SNode, and assigns values to the elements inside it.
- *
- * When appending a struct, the size of vals must be equal to
- * the number of elements in the struct. When appending a scalar,
- * the size of vals must be one.
- */
+Expr assume_range(const Expr &expr,
+                  const Expr &base,
+                  int low,
+                  int high,
+                  const DebugInfo &dbg_info = DebugInfo());
 
-Expr snode_append(SNode *snode,
-                  const ExprGroup &indices,
-                  const std::vector<Expr> &vals);
-
-Expr snode_is_active(SNode *snode, const ExprGroup &indices);
-
-Expr snode_length(SNode *snode, const ExprGroup &indices);
-
-Expr snode_get_addr(SNode *snode, const ExprGroup &indices);
-
-Expr assume_range(const Expr &expr, const Expr &base, int low, int high);
-
-Expr loop_unique(const Expr &input, const std::vector<SNode *> &covers);
+Expr loop_unique(const Expr &input,
+                 const std::vector<SNode *> &covers,
+                 const DebugInfo &dbg_info = DebugInfo());
 
 Expr expr_field(Expr id_expr, DataType dt);
 

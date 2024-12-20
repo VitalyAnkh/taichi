@@ -1,4 +1,10 @@
-#include "common.h"
+#ifdef RHI_EXAMPLE_BACKEND_VULKAN
+#include "common_vulkan.h"
+#endif  // RHI_EXAMPLE_BACKEND_VULKAN
+
+#ifdef RHI_EXAMPLE_BACKEND_METAL
+#include "common_metal.h"
+#endif
 
 std::vector<uint32_t> frag_spv =
 #include "shaders/2_triangle.frag.spv.h"
@@ -62,15 +68,23 @@ class SampleApp : public App {
 
     // Create the vertex buffer
     {
-      vertex_buffer = device->allocate_memory_unique(Device::AllocParams{
+      auto [buf, res] = device->allocate_memory_unique(Device::AllocParams{
           /* size = */ 3 * sizeof(Vertex),
           /* host_write = */ true,
           /* host_read = */ false, /* export_sharing = */ false,
           /* usage = */ AllocUsage::Vertex});
+      TI_ASSERT(res == RhiResult::success);
+      vertex_buffer = std::move(buf);
       void *mapped{nullptr};
       TI_ASSERT(device->map(*vertex_buffer, &mapped) == RhiResult::success);
       memcpy(mapped, vertices.data(), sizeof(Vertex) * vertices.size());
       device->unmap(*vertex_buffer);
+    }
+
+    // Define the raster state
+    {
+      raster_resources = device->create_raster_resources_unique();
+      raster_resources->vertex_buffer(vertex_buffer->get_ptr(0), 0);
     }
 
     TI_INFO("App Init Done");
@@ -78,7 +92,9 @@ class SampleApp : public App {
 
   std::vector<StreamSemaphore> render_loop(
       StreamSemaphore image_available_semaphore) override {
-    auto cmdlist = device->get_graphics_stream()->new_command_list();
+    auto [cmdlist, res] =
+        device->get_graphics_stream()->new_command_list_unique();
+    TI_ASSERT(res == RhiResult::success);
 
     // Set-up our frame buffer attachment
     DeviceAllocation surface_image = surface->get_target_image();
@@ -94,10 +110,9 @@ class SampleApp : public App {
 
     // Bind our triangle pipeline
     cmdlist->bind_pipeline(pipeline.get());
-    // Get the binder and bind our vertex buffer
-    auto resource_binder = pipeline->resource_binder();
-    resource_binder->vertex_buffer(vertex_buffer->get_ptr(0), 0);
-    cmdlist->bind_resources(resource_binder);
+    res = cmdlist->bind_raster_resources(raster_resources.get());
+    TI_ASSERT_INFO(res == RhiResult::success,
+                   "Raster res bind fault: RhiResult({})", res);
     // Render the triangle
     cmdlist->draw(3, 0);
     // End rendering
@@ -110,9 +125,10 @@ class SampleApp : public App {
   }
 
  public:
-  std::unique_ptr<Pipeline> pipeline;
+  std::unique_ptr<Pipeline> pipeline{nullptr};
+  std::unique_ptr<RasterResources> raster_resources{nullptr};
 
-  std::unique_ptr<DeviceAllocationGuard> vertex_buffer;
+  std::unique_ptr<DeviceAllocationGuard> vertex_buffer{nullptr};
 };
 
 int main() {

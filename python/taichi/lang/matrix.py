@@ -1,6 +1,7 @@
+import functools
 import numbers
-import warnings
 from collections.abc import Iterable
+from itertools import product
 
 import numpy as np
 from taichi._lib import core as ti_python_core
@@ -10,41 +11,70 @@ from taichi.lang import runtime_ops
 from taichi.lang._ndarray import Ndarray, NdarrayHostAccess
 from taichi.lang.common_ops import TaichiOperations
 from taichi.lang.enums import Layout
-from taichi.lang.exception import (TaichiRuntimeError, TaichiSyntaxError,
-                                   TaichiTypeError)
+from taichi.lang.exception import (
+    TaichiRuntimeError,
+    TaichiRuntimeTypeError,
+    TaichiSyntaxError,
+    TaichiTypeError,
+)
 from taichi.lang.field import Field, ScalarField, SNodeHostAccess
-from taichi.lang.swizzle_generator import SwizzleGenerator
-from taichi.lang.util import (cook_dtype, in_python_scope, python_scope,
-                              taichi_scope, to_numpy_type, to_paddle_type,
-                              to_pytorch_type, warning)
+from taichi.lang.util import (
+    cook_dtype,
+    get_traceback,
+    in_python_scope,
+    python_scope,
+    taichi_scope,
+    to_numpy_type,
+    to_paddle_type,
+    to_pytorch_type,
+    warning,
+)
 from taichi.types import primitive_types
-from taichi.types.compound_types import CompoundType, TensorType
+from taichi.types.compound_types import CompoundType
+from taichi.types.utils import is_signed
+from taichi._lib.utils import ti_python_core as _ti_python_core
+
+_type_factory = _ti_python_core.get_type_factory_instance()
+
+
+def _generate_swizzle_patterns(key_group: str, required_length=4):
+    """Generate vector swizzle patterns from a given set of characters.
+
+    Example:
+
+        For `key_group=xyzw` and `required_length=4`, this function will return a
+        list consists of all possible strings (no repeats) in characters
+        `x`, `y`, `z`, `w` and of length<=4:
+        [`x`, `y`, `z`, `w`, `xx`, `xy`, `yx`, ..., `xxxx`, `xxxy`, `xyzw`, ...]
+        The length of the list will be 4 + 4x4 + 4x4x4 + 4x4x4x4 = 340.
+    """
+    result = []
+    for k in range(1, required_length + 1):
+        result.extend(product(key_group, repeat=k))
+    result = ["".join(pat) for pat in result]
+    return result
 
 
 def _gen_swizzles(cls):
-    swizzle_gen = SwizzleGenerator()
     # https://www.khronos.org/opengl/wiki/Data_Type_(GLSL)#Swizzling
-    KEYGROUP_SET = ['xyzw', 'rgba', 'stpq']
+    KEYGROUP_SET = ["xyzw", "rgba", "stpq"]
     cls._swizzle_to_keygroup = {}
     cls._keygroup_to_checker = {}
 
     def make_valid_attribs_checker(key_group):
         def check(instance, pattern):
-            valid_attribs = set(key_group[:instance.n])
+            valid_attribs = set(key_group[: instance.n])
             pattern_set = set(pattern)
             diff = pattern_set - valid_attribs
             if len(diff):
                 valid_attribs = tuple(sorted(valid_attribs))
                 pattern = tuple(pattern)
-                raise TaichiSyntaxError(
-                    f'vec{instance.n} only has '
-                    f'attributes={valid_attribs}, got={pattern}')
+                raise TaichiSyntaxError(f"vec{instance.n} only has " f"attributes={valid_attribs}, got={pattern}")
 
         return check
 
     for key_group in KEYGROUP_SET:
-        cls._keygroup_to_checker[key_group] = make_valid_attribs_checker(
-            key_group)
+        cls._keygroup_to_checker[key_group] = make_valid_attribs_checker(key_group)
         for index, attr in enumerate(key_group):
 
             def gen_property(attr, attr_idx, key_group):
@@ -52,7 +82,7 @@ def _gen_swizzles(cls):
 
                 def prop_getter(instance):
                     checker(instance, attr)
-                    return instance._impl._get_entry_and_read([attr_idx])
+                    return instance[attr_idx]
 
                 @python_scope
                 def prop_setter(instance, value):
@@ -66,221 +96,109 @@ def _gen_swizzles(cls):
             cls._swizzle_to_keygroup[attr] = key_group
 
     for key_group in KEYGROUP_SET:
-        sw_patterns = swizzle_gen.generate(key_group, required_length=4)
+        sw_patterns = _generate_swizzle_patterns(key_group, required_length=4)
         # len=1 accessors are handled specially above
         sw_patterns = filter(lambda p: len(p) > 1, sw_patterns)
-        for pat in sw_patterns:
+        for prop_key in sw_patterns:
             # Create a function for value capturing
             def gen_property(pattern, key_group):
                 checker = cls._keygroup_to_checker[key_group]
-                prop_key = ''.join(pattern)
 
                 def prop_getter(instance):
                     checker(instance, pattern)
                     res = []
                     for ch in pattern:
-                        res.append(
-                            instance._impl._get_entry(key_group.index(ch)))
+                        res.append(instance[key_group.index(ch)])
                     return Vector(res)
 
                 @python_scope
                 def prop_setter(instance, value):
                     if len(pattern) != len(value):
-                        raise TaichiRuntimeError(
-                            f'value len does not match the swizzle pattern={prop_key}'
-                        )
+                        raise TaichiRuntimeError(f"value len does not match the swizzle pattern={pattern}")
                     checker(instance, pattern)
                     for ch, val in zip(pattern, value):
                         instance[key_group.index(ch)] = val
 
                 prop = property(prop_getter, prop_setter)
-                return prop_key, prop
+                return prop
 
-            prop_key, prop = gen_property(pat, key_group)
+            prop = gen_property(prop_key, key_group)
             setattr(cls, prop_key, prop)
             cls._swizzle_to_keygroup[prop_key] = key_group
     return cls
 
 
+def _infer_entry_dt(entry):
+    if isinstance(entry, (int, np.integer)):
+        return impl.get_runtime().default_ip
+    if isinstance(entry, (float, np.floating)):
+        return impl.get_runtime().default_fp
+    if isinstance(entry, expr.Expr):
+        dt = entry.ptr.get_rvalue_type()
+        if dt == ti_python_core.DataType_unknown:
+            raise TaichiTypeError("Element type of the matrix cannot be inferred. Please set dt instead for now.")
+        return dt
+    raise TaichiTypeError("Element type of the matrix is invalid.")
+
+
+def _infer_array_dt(arr):
+    assert len(arr) > 0
+    return functools.reduce(ti_python_core.promoted_type, map(_infer_entry_dt, arr))
+
+
+def make_matrix_with_shape(arr, shape, dt):
+    return expr.Expr(
+        impl.get_runtime()
+        .compiling_callable.ast_builder()
+        .make_matrix_expr(
+            shape,
+            dt,
+            [expr.Expr(elt).ptr for elt in arr],
+            ti_python_core.DebugInfo(impl.get_runtime().get_current_src_info()),
+        )
+    )
+
+
 def make_matrix(arr, dt=None):
     if len(arr) == 0:
         # the only usage of an empty vector is to serve as field indices
-        is_matrix = False
+        shape = [0]
         dt = primitive_types.i32
     else:
-        is_matrix = isinstance(arr[0], Iterable)
+        if isinstance(arr[0], Iterable):  # matrix
+            shape = [len(arr), len(arr[0])]
+            arr = [elt for row in arr for elt in row]
+        else:  # vector
+            shape = [len(arr)]
         if dt is None:
-            dt = _make_entries_initializer(is_matrix).infer_dt(arr)
+            dt = _infer_array_dt(arr)
         else:
             dt = cook_dtype(dt)
-    if not is_matrix:
-        return impl.Expr(
-            impl.make_matrix_expr([len(arr)], dt,
-                                  [expr.Expr(elt).ptr for elt in arr]))
-    return impl.Expr(
-        impl.make_matrix_expr(
-            [len(arr), len(arr[0])], dt,
-            [expr.Expr(elt).ptr for row in arr for elt in row]))
+    return expr.Expr(
+        impl.get_runtime()
+        .compiling_callable.ast_builder()
+        .make_matrix_expr(
+            shape,
+            dt,
+            [expr.Expr(elt).ptr for elt in arr],
+            ti_python_core.DebugInfo(impl.get_runtime().get_current_src_info()),
+        )
+    )
 
 
-def is_vector(x):
-    return isinstance(x, Vector) or getattr(x, "ndim", None) == 1
+def _read_host_access(x):
+    if isinstance(x, SNodeHostAccess):
+        return x.accessor.getter(*x.key)
+    assert isinstance(x, NdarrayHostAccess)
+    return x.getter()
 
 
-def is_col_vector(x):
-    return is_vector(x) and getattr(x, "m", None) == 1
-
-
-class _PyScopeMatrixImpl:
-    def __init__(self, m, n, entries):
-        self.m = m
-        self.n = n
-        self.entries = entries
-
-    def _get_entry(self, *indices):
-        return self.entries[self._linearize_entry_id(*indices)]
-
-    def _get_entry_and_read(self, indices):
-        # Can be invoked in both Python and Taichi scope. `indices` must be
-        # compile-time constants (e.g. Python values)
-        ret = self._get_entry(*indices)
-
-        if isinstance(ret, SNodeHostAccess):
-            ret = ret.accessor.getter(*ret.key)
-        elif isinstance(ret, NdarrayHostAccess):
-            ret = ret.getter()
-        return ret
-
-    def _linearize_entry_id(self, *args):
-        assert 1 <= len(args) <= 2
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            args = args[0]
-        if len(args) == 1:
-            args = args + (0, )
-        # TODO(#1004): See if it's possible to support indexing at runtime
-        for i, a in enumerate(args):
-            if not isinstance(a, (int, np.integer)):
-                raise TaichiSyntaxError(
-                    f'The {i}-th index of a Matrix/Vector must be a compile-time constant '
-                    f'integer, got {type(a)}.\n'
-                    'This is because matrix operations will be **unrolled** at compile-time '
-                    'for performance reason.\n'
-                    'If you want to *iterate through matrix elements*, use a static range:\n'
-                    '  for i in ti.static(range(3)):\n'
-                    '    print(i, "-th component is", vec[i])\n'
-                    'See https://docs.taichi-lang.org/docs/meta#when-to-use-tistatic-with-for-loops for more details.'
-                    'Or turn on ti.init(..., dynamic_index=True) to support indexing with variables!'
-                )
-        assert 0 <= args[0] < self.n, \
-            f"The 0-th matrix index is out of range: 0 <= {args[0]} < {self.n}"
-        assert 0 <= args[1] < self.m, \
-            f"The 1-th matrix index is out of range: 0 <= {args[1]} < {self.m}"
-        return args[0] * self.m + args[1]
-
-    def __getitem__(self, indices):
-        """Access to the element at the given indices in a matrix.
-
-        Args:
-            indices (Sequence[Expr]): the indices of the element.
-
-        Returns:
-            The value of the element at a specific position of a matrix.
-
-        """
-        return self.subscript_scope_ignored(indices)
-
-    def subscript_scope_ignored(self, indices):
-        if not isinstance(indices, (list, tuple)):
-            indices = [indices]
-        assert len(indices) in [1, 2]
-        i = indices[0]
-        j = 0 if len(indices) == 1 else indices[1]
-        if isinstance(i, slice) or isinstance(j, slice):
-            return self._get_slice(i, j)
-        return self._get_entry_and_read([i, j])
-
-    @python_scope
-    def __setitem__(self, indices, item):
-        """Set the element value at the given indices in a matrix.
-
-        Args:
-            indices (Sequence[Expr]): the indices of a element.
-
-        """
-        if not isinstance(indices, (list, tuple)):
-            indices = [indices]
-        assert len(indices) in [1, 2]
-        i = indices[0]
-        j = 0 if len(indices) == 1 else indices[1]
-        idx = self._linearize_entry_id(i, j)
-        if isinstance(self.entries[idx], SNodeHostAccess):
-            self.entries[idx].accessor.setter(item, *self.entries[idx].key)
-        elif isinstance(self.entries[idx], NdarrayHostAccess):
-            self.entries[idx].setter(item)
-        else:
-            self.entries[idx] = item
-
-    def _get_slice(self, a, b):
-        if not isinstance(a, slice):
-            a = [a]
-        else:
-            a = range(a.start or 0, a.stop or self.n, a.step or 1)
-        if not isinstance(b, slice):
-            b = [b]
-        else:
-            b = range(b.start or 0, b.stop or self.m, b.step or 1)
-        return Matrix([[self._get_entry(i, j) for j in b] for i in a])
-
-    def _set_entries(self, value):
-        if not isinstance(value, (list, tuple)):
-            value = list(value)
-        if not isinstance(value[0], (list, tuple)):
-            value = [[i] for i in value]
-        for i in range(self.n):
-            for j in range(self.m):
-                self[i, j] = value[i][j]
-
-
-class _MatrixEntriesInitializer:
-    def pyscope(self, arr):
-        raise NotImplementedError('Override')
-
-    def _get_entry_to_infer(self, arr):
-        raise NotImplementedError('Override')
-
-    def infer_dt(self, arr):
-        entry = self._get_entry_to_infer(arr)
-        if isinstance(entry, (int, np.integer)):
-            return impl.get_runtime().default_ip
-        if isinstance(entry, float):
-            return impl.get_runtime().default_fp
-        if isinstance(entry, expr.Expr):
-            dt = entry.ptr.get_ret_type()
-            if dt == ti_python_core.DataType_unknown:
-                raise TypeError(
-                    'Element type of the matrix cannot be inferred. Please set dt instead for now.'
-                )
-            return dt
-        raise Exception(
-            'dt required when using dynamic_index for local tensor')
-
-
-def _make_entries_initializer(is_matrix: bool) -> _MatrixEntriesInitializer:
-    class _VecImpl(_MatrixEntriesInitializer):
-        def pyscope(self, arr):
-            return [[x] for x in arr]
-
-        def _get_entry_to_infer(self, arr):
-            return arr[0]
-
-    class _MatImpl(_MatrixEntriesInitializer):
-        def pyscope(self, arr):
-            return [list(row) for row in arr]
-
-        def _get_entry_to_infer(self, arr):
-            return arr[0][0]
-
-    return _MatImpl() if is_matrix else _VecImpl()
+def _write_host_access(x, value):
+    if isinstance(x, SNodeHostAccess):
+        x.accessor.setter(value, *x.key)
+    else:
+        assert isinstance(x, NdarrayHostAccess)
+        x.setter(value)
 
 
 @_gen_swizzles
@@ -324,125 +242,59 @@ class Matrix(TaichiOperations):
         >>> M.m
         0
     """
+
     _is_taichi_class = True
     _is_matrix_class = True
     __array_priority__ = 1000
 
-    def __init__(self, arr, dt=None, ndim=None):
+    def __init__(self, arr, dt=None):
         if not isinstance(arr, (list, tuple, np.ndarray)):
-            raise TaichiTypeError(
-                "An Matrix/Vector can only be initialized with an array-like object"
-            )
+            raise TaichiTypeError("An Matrix/Vector can only be initialized with an array-like object")
         if len(arr) == 0:
-            mat = []
             self.ndim = 0
+            self.n, self.m = 0, 0
+            self.entries = np.array([])
+            self.is_host_access = False
         elif isinstance(arr[0], Matrix):
-            raise Exception('cols/rows required when using list of vectors')
-        else:
-            if ndim is not None:
-                self.ndim = ndim
-                is_matrix = ndim == 2
+            raise Exception("cols/rows required when using list of vectors")
+        elif isinstance(arr[0], Iterable):  # matrix
+            self.ndim = 2
+            self.n, self.m = len(arr), len(arr[0])
+            if isinstance(arr[0][0], (SNodeHostAccess, NdarrayHostAccess)):
+                self.entries = arr
+                self.is_host_access = True
             else:
-                is_matrix = isinstance(arr[0],
-                                       Iterable) and not is_vector(self)
-                self.ndim = 2 if is_matrix else 1
-            initializer = _make_entries_initializer(is_matrix)
-            if not is_matrix and isinstance(arr[0], Iterable):
-                flattened = []
-                for row in arr:
-                    flattened += row
-                arr = flattened
-            mat = initializer.pyscope(arr)
-
-        self.n, self.m = len(mat), 1
-        if len(mat) > 0:
-            self.m = len(mat[0])
-        entries = [x for row in mat for x in row]
-
-        if ndim is not None:
-            # override ndim after reading data from mat
-            assert ndim in (0, 1, 2)
-            self.ndim = ndim
+                self.entries = np.array(arr, None if dt is None else to_numpy_type(dt))
+                self.is_host_access = False
+        else:  # vector
+            self.ndim = 1
+            self.n, self.m = len(arr), 1
+            if isinstance(arr[0], (SNodeHostAccess, NdarrayHostAccess)):
+                self.entries = arr
+                self.is_host_access = True
+            else:
+                self.entries = np.array(arr, None if dt is None else to_numpy_type(dt))
+                self.is_host_access = False
 
         if self.n * self.m > 32:
             warning(
-                f'Taichi matrices/vectors with {self.n}x{self.m} > 32 entries are not suggested.'
-                ' Matrices/vectors will be automatically unrolled at compile-time for performance.'
-                ' So the compilation time could be extremely long if the matrix size is too big.'
-                ' You may use a field to store a large matrix like this, e.g.:\n'
-                f'    x = ti.field(ti.f32, ({self.n}, {self.m})).\n'
-                ' See https://docs.taichi-lang.org/docs/field#matrix-size'
-                ' for more details.',
+                f"Taichi matrices/vectors with {self.n}x{self.m} > 32 entries are not suggested."
+                " Matrices/vectors will be automatically unrolled at compile-time for performance."
+                " So the compilation time could be extremely long if the matrix size is too big."
+                " You may use a field to store a large matrix like this, e.g.:\n"
+                f"    x = ti.field(ti.f32, ({self.n}, {self.m})).\n"
+                " See https://docs.taichi-lang.org/docs/field#matrix-size"
+                " for more details.",
                 UserWarning,
-                stacklevel=2)
-        m, n = self.m, self.n
-        self._impl = _PyScopeMatrixImpl(m, n, entries)
+                stacklevel=2,
+            )
 
     def get_shape(self):
         if self.ndim == 1:
-            return (self.n, )
+            return (self.n,)
         if self.ndim == 2:
             return (self.n, self.m)
         return None
-
-    def element_type(self):
-        if self._impl.entries:
-            if in_python_scope():
-                return type(self._impl.entries[0])
-            return getattr(self._impl.entries[0], 'element_type',
-                           lambda: None)()
-        return None
-
-    def _element_wise_binary(self, foo, other):
-        other = self._broadcast_copy(other)
-        if is_col_vector(self):
-            return Vector([foo(self(i), other(i)) for i in range(self.n)],
-                          ndim=self.ndim)
-        return Matrix([[foo(self(i, j), other(i, j)) for j in range(self.m)]
-                       for i in range(self.n)],
-                      ndim=self.ndim)
-
-    def _broadcast_copy(self, other):
-        if isinstance(other, (list, tuple)):
-            if is_col_vector(self):
-                other = Vector(other, ndim=self.ndim)
-            else:
-                other = Matrix(other, ndim=self.ndim)
-        if not isinstance(other, Matrix):
-            if isinstance(self, Vector):
-                other = Vector([other for _ in range(self.n)])
-            else:
-                other = Matrix([[other for _ in range(self.m)]
-                                for _ in range(self.n)],
-                               ndim=self.ndim)
-        assert self.m == other.m and self.n == other.n, f"Dimension mismatch between shapes ({self.n}, {self.m}), ({other.n}, {other.m})"
-        return other
-
-    def _element_wise_ternary(self, foo, other, extra):
-        other = self._broadcast_copy(other)
-        extra = self._broadcast_copy(extra)
-        return Matrix([[
-            foo(self(i, j), other(i, j), extra(i, j)) for j in range(self.m)
-        ] for i in range(self.n)],
-                      ndim=self.ndim)
-
-    def _element_wise_writeback_binary(self, foo, other):
-        if foo.__name__ == 'assign' and not isinstance(other,
-                                                       (list, tuple, Matrix)):
-            raise TaichiSyntaxError(
-                'cannot assign scalar expr to '
-                f'taichi class {type(self)}, maybe you want to use `a.fill(b)` instead?'
-            )
-        other = self._broadcast_copy(other)
-        entries = [[foo(self(i, j), other(i, j)) for j in range(self.m)]
-                   for i in range(self.n)]
-        return self if foo.__name__ == 'assign' else Matrix(entries,
-                                                            ndim=self.ndim)
-
-    def _element_wise_unary(self, foo):
-        return Matrix([[foo(self(i, j)) for j in range(self.m)]
-                       for i in range(self.n)],
-                      ndim=self.ndim)
 
     def __matmul__(self, other):
         """Matrix-matrix or matrix-vector multiply.
@@ -455,6 +307,7 @@ class Matrix(TaichiOperations):
 
         """
         from taichi.lang import matrix_ops  # pylint: disable=C0415
+
         return matrix_ops.matmul(self, other)
 
     # host access & python scope operation
@@ -464,9 +317,9 @@ class Matrix(TaichiOperations):
         return self.n
 
     def __iter__(self):
-        if self.m == 1:
-            return (self(i) for i in range(self.n))
-        return ([self(i, j) for j in range(self.m)] for i in range(self.n))
+        if self.ndim == 1:
+            return (self[i] for i in range(self.n))
+        return ([self[i, j] for j in range(self.m)] for i in range(self.n))
 
     def __getitem__(self, indices):
         """Access to the element at the given indices in a matrix.
@@ -478,12 +331,10 @@ class Matrix(TaichiOperations):
             The value of the element at a specific position of a matrix.
 
         """
-        if not isinstance(indices, Iterable):
-            indices = [indices]
-        assert len(
-            indices
-        ) == self.ndim, f"Expected {self.ndim} indices, got {len(indices)}"
-        return self._impl[indices]
+        entry = self._get_entry(indices)
+        if self.is_host_access:
+            return _read_host_access(entry)
+        return entry
 
     @python_scope
     def __setitem__(self, indices, item):
@@ -493,26 +344,60 @@ class Matrix(TaichiOperations):
             indices (Sequence[Expr]): the indices of a element.
 
         """
-        if not isinstance(indices, Iterable):
-            indices = [indices]
-        assert len(
-            indices
-        ) == self.ndim, f"Expected {self.ndim} indices, got {len(indices)}"
-        self._impl[indices] = item
+        if self.is_host_access:
+            entry = self._get_entry(indices)
+            _write_host_access(entry, item)
+        else:
+            if not isinstance(indices, (list, tuple)):
+                indices = [indices]
+            assert len(indices) in [1, 2]
+            assert len(indices) == self.ndim, f"Expected {self.ndim} indices, got {len(indices)}"
+            if self.ndim == 1:
+                self.entries[indices[0]] = item
+            else:
+                self.entries[indices[0]][indices[1]] = item
 
-    def __call__(self, *args, **kwargs):
-        # TODO: It's quite hard to search for __call__, consider replacing this
-        # with a method of actual names?
-        assert kwargs == {}
-        return self._impl._get_entry_and_read(args)
+    def _get_entry(self, indices):
+        if not isinstance(indices, (list, tuple)):
+            indices = [indices]
+        assert len(indices) in [1, 2]
+        assert len(indices) == self.ndim, f"Expected {self.ndim} indices, got {len(indices)}"
+        if self.ndim == 1:
+            return self.entries[indices[0]]
+        return self.entries[indices[0]][indices[1]]
+
+    def _get_slice(self, a, b):
+        if isinstance(a, slice):
+            a = range(a.start or 0, a.stop or self.n, a.step or 1)
+        if isinstance(b, slice):
+            b = range(b.start or 0, b.stop or self.m, b.step or 1)
+        if isinstance(a, range) and isinstance(b, range):
+            return Matrix([[self._get_entry(i, j) for j in b] for i in a])
+        if isinstance(a, range):  # b is not range
+            return Vector([self._get_entry(i, b) for i in a])
+        # a is not range while b is range
+        return Vector([self._get_entry(a, j) for j in b])
 
     @python_scope
     def _set_entries(self, value):
-        self._impl._set_entries(value)
-
-    @property
-    def entries(self):
-        return self._impl.entries
+        if isinstance(value, Matrix):
+            value = value.to_list()
+        if self.is_host_access:
+            if self.ndim == 1:
+                for i in range(self.n):
+                    _write_host_access(self.entries[i], value[i])
+            else:
+                for i in range(self.n):
+                    for j in range(self.m):
+                        _write_host_access(self.entries[i][j], value[i][j])
+        else:
+            if self.ndim == 1:
+                for i in range(self.n):
+                    self.entries[i] = value[i]
+            else:
+                for i in range(self.n):
+                    for j in range(self.m):
+                        self.entries[i][j] = value[i][j]
 
     @property
     def _members(self):
@@ -524,9 +409,12 @@ class Matrix(TaichiOperations):
         This is similar to `numpy.ndarray`'s `flatten` and `ravel` methods,
         the difference is that this function always returns a new list.
         """
-        if is_col_vector(self):
-            return [self(i) for i in range(self.n)]
-        return [[self(i, j) for j in range(self.m)] for i in range(self.n)]
+        if self.is_host_access:
+            if self.ndim == 1:
+                return [_read_host_access(self.entries[i]) for i in range(self.n)]
+            assert self.ndim == 2
+            return [[_read_host_access(self.entries[i][j]) for j in range(self.m)] for i in range(self.n)]
+        return self.entries.tolist()
 
     @taichi_scope
     def cast(self, dtype):
@@ -546,14 +434,9 @@ class Matrix(TaichiOperations):
             >>> B
             [0.0, 1.0, 2.0]
         """
-        if is_col_vector(self):
-            # when using _IntermediateMatrix, we can only check `self.ndim`
-            return Vector(
-                [ops_mod.cast(self(i), dtype) for i in range(self.n)])
-        return Matrix(
-            [[ops_mod.cast(self(i, j), dtype) for j in range(self.m)]
-             for i in range(self.n)],
-            ndim=self.ndim)
+        if self.ndim == 1:
+            return Vector([ops_mod.cast(self[i], dtype) for i in range(self.n)])
+        return Matrix([[ops_mod.cast(self[i, j], dtype) for j in range(self.m)] for i in range(self.n)])
 
     def trace(self):
         """The sum of a matrix diagonal elements.
@@ -571,6 +454,7 @@ class Matrix(TaichiOperations):
         """
         # pylint: disable-msg=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.trace(self)
 
     def inverse(self):
@@ -586,6 +470,7 @@ class Matrix(TaichiOperations):
             Exception: Inversions of matrices with sizes >= 5 are not supported.
         """
         from taichi.lang import matrix_ops  # pylint: disable=C0415
+
         return matrix_ops.inverse(self)
 
     def normalized(self, eps=0):
@@ -606,6 +491,7 @@ class Matrix(TaichiOperations):
         """
         # pylint: disable-msg=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.normalized(self, eps)
 
     def transpose(self):
@@ -622,6 +508,7 @@ class Matrix(TaichiOperations):
         """
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.transpose(self)
 
     @taichi_scope
@@ -639,6 +526,7 @@ class Matrix(TaichiOperations):
         """
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.determinant(a)
 
     @staticmethod
@@ -662,6 +550,7 @@ class Matrix(TaichiOperations):
         """
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.diag(dim, val)
 
     def sum(self):
@@ -675,6 +564,7 @@ class Matrix(TaichiOperations):
         """
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.sum(self)
 
     def norm(self, eps=0):
@@ -695,6 +585,7 @@ class Matrix(TaichiOperations):
         """
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.norm(self, eps=eps)
 
     def norm_inv(self, eps=0):
@@ -708,24 +599,28 @@ class Matrix(TaichiOperations):
         """
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.norm_inv(self, eps=eps)
 
     def norm_sqr(self):
         """Returns the sum of the absolute squares of its elements."""
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.norm_sqr(self)
 
     def max(self):
         """Returns the maximum element value."""
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.max(self)
 
     def min(self):
         """Returns the minimum element value."""
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.min(self)
 
     def any(self):
@@ -742,6 +637,7 @@ class Matrix(TaichiOperations):
         """
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.any(self)
 
     def all(self):
@@ -758,6 +654,7 @@ class Matrix(TaichiOperations):
         """
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.all(self)
 
     def fill(self, val):
@@ -775,16 +672,11 @@ class Matrix(TaichiOperations):
         """
         # pylint: disable=C0415
         from taichi.lang import matrix_ops
+
         return matrix_ops.fill(self, val)
 
-    @python_scope
-    def to_numpy(self, keep_dims=False):
+    def to_numpy(self):
         """Converts this matrix to a numpy array.
-
-        Args:
-            keep_dims (bool, optional): Whether to keep the dimension
-                after conversion. If set to `False`, the resulting numpy array
-                will discard the axis of length one.
 
         Returns:
             numpy.ndarray: The result numpy array.
@@ -792,34 +684,34 @@ class Matrix(TaichiOperations):
         Example::
 
             >>> A = ti.Matrix([[0], [1], [2], [3]])
-            >>> A.to_numpy(keep_dims=False)
+            >>> A.to_numpy()
             >>> A
-            array([0, 1, 2, 3])
+            array([[0], [1], [2], [3]])
         """
-        as_vector = self.m == 1 and not keep_dims
-        shape_ext = (self.n, ) if as_vector else (self.n, self.m)
-        return np.array(self.to_list()).reshape(shape_ext)
+        if self.is_host_access:
+            return np.array(self.to_list())
+        return self.entries
 
     @taichi_scope
     def __ti_repr__(self):
-        yield '['
+        yield "["
         for i in range(self.n):
             if i:
-                yield ', '
+                yield ", "
             if self.m != 1:
-                yield '['
+                yield "["
             for j in range(self.m):
                 if j:
-                    yield ', '
+                    yield ", "
                 yield self(i, j)
             if self.m != 1:
-                yield ']'
-        yield ']'
+                yield "]"
+        yield "]"
 
     def __str__(self):
         """Python scope matrix print support."""
         if impl.inside_kernel():
-            '''
+            """
             It seems that when pybind11 got an type mismatch, it will try
             to invoke `repr` to show the object... e.g.:
 
@@ -829,8 +721,8 @@ class Matrix(TaichiOperations):
             Invoked with: <Taichi 2x1 Matrix>
 
             So we have to make it happy with a dummy string...
-            '''
-            return f'<{self.n}x{self.m} ti.Matrix>'
+            """
+            return f"<{self.n}x{self.m} ti.Matrix>"
         return str(self.to_numpy())
 
     def __repr__(self):
@@ -851,6 +743,7 @@ class Matrix(TaichiOperations):
 
         """
         from taichi.lang import matrix_ops  # pylint: disable=C0415
+
         if m is None:
             return matrix_ops._filled_vector(n, dt, 0)
         return matrix_ops._filled_matrix(n, m, dt, 0)
@@ -870,6 +763,7 @@ class Matrix(TaichiOperations):
 
         """
         from taichi.lang import matrix_ops  # pylint: disable=C0415
+
         if m is None:
             return matrix_ops._filled_vector(n, dt, 1)
         return matrix_ops._filled_matrix(n, m, dt, 1)
@@ -895,6 +789,7 @@ class Matrix(TaichiOperations):
             [0, 1, 0]
         """
         from taichi.lang import matrix_ops  # pylint: disable=C0415
+
         if dt is None:
             dt = int
         assert 0 <= i < n
@@ -913,41 +808,25 @@ class Matrix(TaichiOperations):
             :class:`~taichi.Matrix`: An `n x n` identity matrix.
         """
         from taichi.lang import matrix_ops  # pylint: disable=C0415
+
         return matrix_ops._identity_matrix(n, dt)
-
-    @staticmethod
-    def rotation2d(alpha):
-        """Returns the matrix representation of the 2D
-        anti-clockwise rotation of angle `alpha`. The angle `alpha`
-        is in radians.
-
-        Example::
-
-            >>> import math
-            >>> ti.Matrix.rotation2d(math.pi/4)
-            [[ 0.70710678 -0.70710678]
-             [ 0.70710678  0.70710678]]
-        """
-        warnings.warn(
-            "`ti.Matrix.rotation2d()` will be removed in release v1.4.0. Use `ti.math.rotation2d()` instead.",
-            DeprecationWarning)
-        from taichi.lang import matrix_ops  # pylint: disable=C0415
-        return matrix_ops._rotation2d_matrix(alpha)
 
     @classmethod
     @python_scope
-    def field(cls,
-              n,
-              m,
-              dtype,
-              shape=None,
-              order=None,
-              name="",
-              offset=None,
-              needs_grad=False,
-              needs_dual=False,
-              layout=Layout.AOS,
-              ndim=None):
+    def field(
+        cls,
+        n,
+        m,
+        dtype,
+        shape=None,
+        order=None,
+        name="",
+        offset=None,
+        needs_grad=False,
+        needs_dual=False,
+        layout=Layout.AOS,
+        ndim=None,
+    ):
         """Construct a data container to hold all elements of the Matrix.
 
         Args:
@@ -973,33 +852,35 @@ class Matrix(TaichiOperations):
             # set different dtype for each element in Matrix
             # see #2135
             if m == 1:
-                assert len(np.shape(dtype)) == 1 and len(
-                    dtype
-                ) == n, f'Please set correct dtype list for Vector. The shape of dtype list should be ({n}, ) instead of {np.shape(dtype)}'
+                assert (
+                    len(np.shape(dtype)) == 1 and len(dtype) == n
+                ), f"Please set correct dtype list for Vector. The shape of dtype list should be ({n}, ) instead of {np.shape(dtype)}"
                 for i in range(n):
                     entries.append(
-                        impl.create_field_member(dtype[i],
-                                                 name=name,
-                                                 needs_grad=needs_grad,
-                                                 needs_dual=needs_dual))
+                        impl.create_field_member(
+                            dtype[i],
+                            name=name,
+                            needs_grad=needs_grad,
+                            needs_dual=needs_dual,
+                        )
+                    )
             else:
-                assert len(np.shape(dtype)) == 2 and len(dtype) == n and len(
-                    dtype[0]
-                ) == m, f'Please set correct dtype list for Matrix. The shape of dtype list should be ({n}, {m}) instead of {np.shape(dtype)}'
+                assert (
+                    len(np.shape(dtype)) == 2 and len(dtype) == n and len(dtype[0]) == m
+                ), f"Please set correct dtype list for Matrix. The shape of dtype list should be ({n}, {m}) instead of {np.shape(dtype)}"
                 for i in range(n):
                     for j in range(m):
                         entries.append(
-                            impl.create_field_member(dtype[i][j],
-                                                     name=name,
-                                                     needs_grad=needs_grad,
-                                                     needs_dual=needs_dual))
+                            impl.create_field_member(
+                                dtype[i][j],
+                                name=name,
+                                needs_grad=needs_grad,
+                                needs_dual=needs_dual,
+                            )
+                        )
         else:
             for _ in range(n * m):
-                entries.append(
-                    impl.create_field_member(dtype,
-                                             name=name,
-                                             needs_grad=needs_grad,
-                                             needs_dual=needs_dual))
+                entries.append(impl.create_field_member(dtype, name=name, needs_grad=needs_grad, needs_dual=needs_dual))
         entries, entries_grad, entries_dual = zip(*entries)
 
         entries = MatrixField(entries, n, m, element_dim)
@@ -1014,35 +895,32 @@ class Matrix(TaichiOperations):
 
         if shape is None:
             if offset is not None:
-                raise TaichiSyntaxError(
-                    'shape cannot be None when offset is set')
+                raise TaichiSyntaxError("shape cannot be None when offset is set")
             if order is not None:
-                raise TaichiSyntaxError(
-                    'shape cannot be None when order is set')
+                raise TaichiSyntaxError("shape cannot be None when order is set")
         else:
             if isinstance(shape, numbers.Number):
-                shape = (shape, )
+                shape = (shape,)
             if isinstance(offset, numbers.Number):
-                offset = (offset, )
+                offset = (offset,)
             dim = len(shape)
             if offset is not None and dim != len(offset):
                 raise TaichiSyntaxError(
-                    f'The dimensionality of shape and offset must be the same ({dim} != {len(offset)})'
+                    f"The dimensionality of shape and offset must be the same ({dim} != {len(offset)})"
                 )
             axis_seq = []
             shape_seq = []
             if order is not None:
                 if dim != len(order):
                     raise TaichiSyntaxError(
-                        f'The dimensionality of shape and order must be the same ({dim} != {len(order)})'
+                        f"The dimensionality of shape and order must be the same ({dim} != {len(order)})"
                     )
                 if dim != len(set(order)):
-                    raise TaichiSyntaxError(
-                        'The axes in order must be different')
+                    raise TaichiSyntaxError("The axes in order must be different")
                 for ch in order:
-                    axis = ord(ch) - ord('i')
+                    axis = ord(ch) - ord("i")
                     if axis < 0 or axis >= dim:
-                        raise TaichiSyntaxError(f'Invalid axis {ch}')
+                        raise TaichiSyntaxError(f"Invalid axis {ch}")
                     axis_seq.append(axis)
                     shape_seq.append(shape[axis])
             else:
@@ -1051,30 +929,19 @@ class Matrix(TaichiOperations):
             same_level = order is None
             if layout == Layout.SOA:
                 for e in entries._get_field_members():
-                    impl._create_snode(axis_seq, shape_seq,
-                                       same_level).place(ScalarField(e),
-                                                         offset=offset)
+                    impl._create_snode(axis_seq, shape_seq, same_level).place(ScalarField(e), offset=offset)
                 if needs_grad:
                     for e in entries_grad._get_field_members():
-                        impl._create_snode(axis_seq, shape_seq,
-                                           same_level).place(ScalarField(e),
-                                                             offset=offset)
+                        impl._create_snode(axis_seq, shape_seq, same_level).place(ScalarField(e), offset=offset)
                 if needs_dual:
                     for e in entries_dual._get_field_members():
-                        impl._create_snode(axis_seq, shape_seq,
-                                           same_level).place(ScalarField(e),
-                                                             offset=offset)
+                        impl._create_snode(axis_seq, shape_seq, same_level).place(ScalarField(e), offset=offset)
             else:
-                impl._create_snode(axis_seq, shape_seq,
-                                   same_level).place(entries, offset=offset)
+                impl._create_snode(axis_seq, shape_seq, same_level).place(entries, offset=offset)
                 if needs_grad:
-                    impl._create_snode(axis_seq, shape_seq,
-                                       same_level).place(entries_grad,
-                                                         offset=offset)
+                    impl._create_snode(axis_seq, shape_seq, same_level).place(entries_grad, offset=offset)
                 if needs_dual:
-                    impl._create_snode(axis_seq, shape_seq,
-                                       same_level).place(entries_dual,
-                                                         offset=offset)
+                    impl._create_snode(axis_seq, shape_seq, same_level).place(entries_dual, offset=offset)
         return entries
 
     @classmethod
@@ -1097,7 +964,7 @@ class Matrix(TaichiOperations):
                 >>> x = ti.Matrix.ndarray(4, 5, ti.f32, shape=(16, 8))
         """
         if isinstance(shape, numbers.Number):
-            shape = (shape, )
+            shape = (shape,)
         return MatrixNdarray(n, m, dtype, shape)
 
     @staticmethod
@@ -1124,6 +991,7 @@ class Matrix(TaichiOperations):
             [[1, 2, 3], [4, 5, 6]]
         """
         from taichi.lang import matrix_ops  # pylint: disable=C0415
+
         return matrix_ops.rows(rows)
 
     @staticmethod
@@ -1149,6 +1017,7 @@ class Matrix(TaichiOperations):
             [[1, 4], [2, 5], [3, 6]]
         """
         from taichi.lang import matrix_ops  # pylint: disable=C0415
+
         return matrix_ops.cols(cols)
 
     def __hash__(self):
@@ -1176,6 +1045,7 @@ class Matrix(TaichiOperations):
             26
         """
         from taichi.lang import matrix_ops  # pylint: disable=C0415
+
         return matrix_ops.dot(self, other)
 
     def cross(self, other):
@@ -1196,6 +1066,7 @@ class Matrix(TaichiOperations):
             :class:`~taichi.Matrix`: The cross product of the two Vectors.
         """
         from taichi.lang import matrix_ops  # pylint: disable=C0415
+
         return matrix_ops.cross(self, other)
 
     def outer_product(self, other):
@@ -1212,6 +1083,7 @@ class Matrix(TaichiOperations):
             :class:`~taichi.Matrix`: The outer product of the two Vectors.
         """
         from taichi.lang import matrix_ops  # pylint: disable=C0415
+
         return matrix_ops.outer_product(self, other)
 
 
@@ -1238,7 +1110,7 @@ class Vector(Matrix):
         super().__init__(arr, dt=dt, **kwargs)
 
     def get_shape(self):
-        return (self.n, )
+        return (self.n,)
 
     @classmethod
     def field(cls, n, dtype, *args, **kwargs):
@@ -1257,7 +1129,6 @@ class Vector(Matrix):
             n (int): Size of the vector.
             dtype (DataType): Data type of each value.
             shape (Union[int, tuple[int]]): Shape of the ndarray.
-            layout (Layout, optional): Memory layout, AOS by default.
 
         Example:
             The code below shows how a Taichi ndarray with vector elements can be declared and defined::
@@ -1265,51 +1136,8 @@ class Vector(Matrix):
                 >>> x = ti.Vector.ndarray(3, ti.f32, shape=(16, 8))
         """
         if isinstance(shape, numbers.Number):
-            shape = (shape, )
+            shape = (shape,)
         return VectorNdarray(n, dtype, shape)
-
-
-class _IntermediateMatrix(Matrix):
-    """Intermediate matrix class for compiler internal use only.
-
-    Args:
-        n (int): Number of rows of the matrix.
-        m (int): Number of columns of the matrix.
-        entries (List[Expr]): All entries of the matrix.
-    """
-    def __init__(self, n, m, entries, ndim=None):
-        assert isinstance(entries, list)
-        assert n * m == len(entries), "Number of entries doesn't match n * m"
-        self.n = n
-        self.m = m
-        if ndim is not None:
-            self.ndim = ndim
-        else:
-            if len(entries) == 0:
-                self.ndim = 0
-            else:
-                self.ndim = 2 if isinstance(entries[0], Iterable) else 1
-        self._impl = _PyScopeMatrixImpl(m, n, entries)
-
-
-class _MatrixFieldElement(_IntermediateMatrix):
-    """Matrix field element class for compiler internal use only.
-
-    Args:
-        field (MatrixField): The matrix field.
-        indices (taichi_python.ExprGroup): Indices of the element.
-    """
-    def __init__(self, field, indices):
-        super().__init__(
-            field.n,
-            field.m, [
-                expr.Expr(
-                    ti_python_core.subscript(
-                        e.ptr, indices,
-                        impl.get_runtime().get_current_src_info()))
-                for e in field._get_field_members()
-            ],
-            ndim=getattr(field, "ndim", 2))
 
 
 class MatrixField(Field):
@@ -1321,6 +1149,7 @@ class MatrixField(Field):
         m (Int): Number of columns.
         ndim (Int): Number of dimensions; forced reshape if given.
     """
+
     def __init__(self, _vars, n, m, ndim=2):
         assert len(_vars) == n * m
         assert ndim in (0, 1, 2)
@@ -1328,8 +1157,7 @@ class MatrixField(Field):
         self.n = n
         self.m = m
         self.ndim = ndim
-        self.ptr = ti_python_core.expr_matrix_field(
-            [var.ptr for var in self.vars], [n, m][:ndim])
+        self.ptr = ti_python_core.expr_matrix_field([var.ptr for var in self.vars], [n, m][:ndim])
 
     def get_scalar_field(self, *indices):
         """Creates a ScalarField using a specific field member.
@@ -1358,26 +1186,30 @@ class MatrixField(Field):
             self.ptr.set_dynamic_index_stride(0)
             return
         length = len(paths[0])
-        if any(
-                len(path) != length or ti_python_core.is_quant(path[length -
-                                                                    1]._dtype)
-                for path in paths):
+        if any(len(path) != length or ti_python_core.is_quant(path[length - 1]._dtype) for path in paths):
             return
         for i in range(length):
             if any(path[i] != paths[0][i] for path in paths):
                 depth_below_lca = i
                 break
         for i in range(depth_below_lca, length - 1):
-            if any(path[i].ptr.type != ti_python_core.SNodeType.dense
-                   or path[i]._cell_size_bytes != paths[0][i]._cell_size_bytes
-                   or path[i + 1]._offset_bytes_in_parent_cell != paths[0][
-                       i + 1]._offset_bytes_in_parent_cell for path in paths):
+            if any(
+                path[i].ptr.type != ti_python_core.SNodeType.dense
+                or path[i]._cell_size_bytes != paths[0][i]._cell_size_bytes
+                or path[i + 1]._offset_bytes_in_parent_cell != paths[0][i + 1]._offset_bytes_in_parent_cell
+                for path in paths
+            ):
                 return
-        stride = paths[1][depth_below_lca]._offset_bytes_in_parent_cell - \
-            paths[0][depth_below_lca]._offset_bytes_in_parent_cell
+        stride = (
+            paths[1][depth_below_lca]._offset_bytes_in_parent_cell
+            - paths[0][depth_below_lca]._offset_bytes_in_parent_cell
+        )
         for i in range(2, num_members):
-            if stride != paths[i][depth_below_lca]._offset_bytes_in_parent_cell \
-                    - paths[i - 1][depth_below_lca]._offset_bytes_in_parent_cell:
+            if (
+                stride
+                != paths[i][depth_below_lca]._offset_bytes_in_parent_cell
+                - paths[i - 1][depth_below_lca]._offset_bytes_in_parent_cell
+            ):
                 return
         self.ptr.set_dynamic_index_stride(stride)
 
@@ -1388,32 +1220,31 @@ class MatrixField(Field):
             val (Union[Number, Expr, List, Tuple, Matrix]): Values to fill,
                 should have consistent dimension consistent with `self`.
         """
-        if isinstance(val, numbers.Number) or (isinstance(val, expr.Expr)
-                                               and not val.is_tensor()):
+        if isinstance(val, numbers.Number) or (isinstance(val, expr.Expr) and not val.is_tensor()):
             if self.ndim == 2:
-                val = tuple(
-                    tuple(val for _ in range(self.m)) for _ in range(self.n))
+                val = tuple(tuple(val for _ in range(self.m)) for _ in range(self.n))
             else:
                 assert self.ndim == 1
                 val = tuple(val for _ in range(self.n))
-        elif isinstance(val, Matrix) or (isinstance(val, expr.Expr)
-                                         and val.is_tensor()):
+        elif isinstance(val, expr.Expr) and val.is_tensor():
             assert val.n == self.n
             if self.ndim != 1:
                 assert val.m == self.m
         else:
+            if isinstance(val, Matrix):
+                val = val.to_list()
             assert isinstance(val, (list, tuple))
             val = tuple(tuple(x) if isinstance(x, list) else x for x in val)
             assert len(val) == self.n
             if self.ndim != 1:
                 assert len(val[0]) == self.m
         if in_python_scope():
-            from taichi._kernels import \
-                field_fill_python_scope  # pylint: disable=C0415
+            from taichi._kernels import field_fill_python_scope  # pylint: disable=C0415
+
             field_fill_python_scope(self, val)
         else:
-            from taichi._funcs import \
-                field_fill_taichi_scope  # pylint: disable=C0415
+            from taichi._funcs import field_fill_taichi_scope  # pylint: disable=C0415
+
             field_fill_taichi_scope(self, val)
 
     @python_scope
@@ -1433,9 +1264,10 @@ class MatrixField(Field):
         if dtype is None:
             dtype = to_numpy_type(self.dtype)
         as_vector = self.m == 1 and not keep_dims
-        shape_ext = (self.n, ) if as_vector else (self.n, self.m)
+        shape_ext = (self.n,) if as_vector else (self.n, self.m)
         arr = np.zeros(self.shape + shape_ext, dtype=dtype)
         from taichi._kernels import matrix_to_ext_arr  # pylint: disable=C0415
+
         matrix_to_ext_arr(self, arr, as_vector)
         runtime_ops.sync()
         return arr
@@ -1452,13 +1284,13 @@ class MatrixField(Field):
             torch.tensor: The result torch tensor.
         """
         import torch  # pylint: disable=C0415
+
         as_vector = self.m == 1 and not keep_dims
-        shape_ext = (self.n, ) if as_vector else (self.n, self.m)
+        shape_ext = (self.n,) if as_vector else (self.n, self.m)
         # pylint: disable=E1101
-        arr = torch.empty(self.shape + shape_ext,
-                          dtype=to_pytorch_type(self.dtype),
-                          device=device)
+        arr = torch.empty(self.shape + shape_ext, dtype=to_pytorch_type(self.dtype), device=device)
         from taichi._kernels import matrix_to_ext_arr  # pylint: disable=C0415
+
         matrix_to_ext_arr(self, arr, as_vector)
         runtime_ops.sync()
         return arr
@@ -1475,14 +1307,17 @@ class MatrixField(Field):
             paddle.Tensor: The result paddle tensor.
         """
         import paddle  # pylint: disable=C0415
+
         as_vector = self.m == 1 and not keep_dims and self.ndim == 1
-        shape_ext = (self.n, ) if as_vector else (self.n, self.m)
+        shape_ext = (self.n,) if as_vector else (self.n, self.m)
         # pylint: disable=E1101
         # paddle.empty() doesn't support argument `place``
-        arr = paddle.to_tensor(paddle.empty(self.shape + shape_ext,
-                                            to_paddle_type(self.dtype)),
-                               place=place)
+        arr = paddle.to_tensor(
+            paddle.empty(self.shape + shape_ext, to_paddle_type(self.dtype)),
+            place=place,
+        )
         from taichi._kernels import matrix_to_ext_arr  # pylint: disable=C0415
+
         matrix_to_ext_arr(self, arr, as_vector)
         runtime_ops.sync()
         return arr
@@ -1498,6 +1333,7 @@ class MatrixField(Field):
         dim_ext = 1 if as_vector else 2
         assert len(arr.shape) == len(self.shape) + dim_ext
         from taichi._kernels import ext_arr_to_matrix  # pylint: disable=C0415
+
         ext_arr_to_matrix(arr, self, as_vector)
         runtime_ops.sync()
 
@@ -1528,13 +1364,11 @@ class MatrixField(Field):
         _host_access = self._host_access(key)
         if self.ndim == 1:
             return Vector([_host_access[i] for i in range(self.n)])
-        return Matrix([[_host_access[i * self.m + j] for j in range(self.m)]
-                       for i in range(self.n)],
-                      ndim=self.ndim)
+        return Matrix([[_host_access[i * self.m + j] for j in range(self.m)] for i in range(self.n)])
 
     def __repr__(self):
         # make interactive shell happy, prevent materialization
-        return f'<{self.n}x{self.m} ti.Matrix.field>'
+        return f"<{self.n}x{self.m} ti.Matrix.field>"
 
 
 class MatrixType(CompoundType):
@@ -1546,8 +1380,11 @@ class MatrixType(CompoundType):
         #                 Remove the None dtype when we are ready to break legacy code.
         if dtype is not None:
             self.dtype = cook_dtype(dtype)
+            shape = (n, m) if ndim == 2 else (n,)
+            self.tensor_type = _type_factory.get_tensor_type(shape, self.dtype)
         else:
             self.dtype = None
+            self.tensor_type = None
 
     def __call__(self, *args):
         """Return a matrix matching the shape and dtype.
@@ -1581,14 +1418,12 @@ class MatrixType(CompoundType):
 
         """
         if len(args) == 0:
-            raise TaichiSyntaxError(
-                "Custom type instances need to be created with an initial value."
-            )
+            raise TaichiSyntaxError("Custom type instances need to be created with an initial value.")
         if len(args) == 1:
             # Init from a real Matrix
             if isinstance(args[0], expr.Expr) and args[0].ptr.is_tensor():
                 arg = args[0]
-                shape = arg.ptr.get_ret_type().shape()
+                shape = arg.ptr.get_rvalue_type().shape()
                 assert self.ndim == len(shape)
                 assert self.n == shape[0]
                 if self.ndim > 1:
@@ -1597,7 +1432,8 @@ class MatrixType(CompoundType):
 
             # initialize by a single scalar, e.g. matnxm(1)
             if isinstance(args[0], (numbers.Number, expr.Expr)):
-                return self.filled_with_scalar(args[0])
+                entries = [args[0] for _ in range(self.m) for _ in range(self.n)]
+                return self._instantiate(entries)
             args = args[0]
         # collect all input entries to a 1d list and then reshape
         # this is mostly for glsl style like vec4(v.xyz, 1.)
@@ -1607,63 +1443,123 @@ class MatrixType(CompoundType):
                 entries += x
             elif isinstance(x, np.ndarray):
                 entries += list(x.ravel())
-            elif isinstance(x, impl.Expr) and x.ptr.is_tensor():
-                entries += [
-                    impl.Expr(e) for e in impl.get_runtime().prog.
-                    current_ast_builder().expand_expr([x.ptr])
-                ]
             elif isinstance(x, Matrix):
-                entries += x.entries
+                entries += x.to_list()
             else:
                 entries.append(x)
 
-        if len(entries) != self.m * self.n:
-            raise TaichiSyntaxError(
-                f"Incompatible arguments for the custom vector/matrix type: ({self.n}, {self.m}), ({len(entries)})"
-            )
-        entries = [[entries[k * self.m + i] for i in range(self.m)]
-                   for k in range(self.n)]
+        return self._instantiate(entries)
 
-        #  type cast
-        return self.cast(Matrix(entries, dt=self.dtype, ndim=self.ndim))
+    def from_taichi_object(self, func_ret, ret_index=()):
+        return self(
+            [
+                expr.Expr(
+                    ti_python_core.make_get_element_expr(
+                        func_ret.ptr,
+                        ret_index + (i,),
+                        _ti_python_core.DebugInfo(impl.get_runtime().get_current_src_info()),
+                    )
+                )
+                for i in range(self.m * self.n)
+            ]
+        )
 
-    def from_real_func_ret(self, func_ret, ret_index=0):
-        return self([
-            expr.Expr(ti_python_core.make_get_element_expr(func_ret.ptr, i))
-            for i in range(ret_index, ret_index + self.m * self.n)
-        ]), ret_index + self.m * self.n
+    def from_kernel_struct_ret(self, launch_ctx, ret_index=()):
+        if self.dtype in primitive_types.integer_types:
+            if is_signed(cook_dtype(self.dtype)):
+                get_ret_func = launch_ctx.get_struct_ret_int
+            else:
+                get_ret_func = launch_ctx.get_struct_ret_uint
+        elif self.dtype in primitive_types.real_types:
+            get_ret_func = launch_ctx.get_struct_ret_float
+        else:
+            raise TaichiRuntimeTypeError(f"Invalid return type on index={ret_index}")
+        return self([get_ret_func(ret_index + (i,)) for i in range(self.m * self.n)])
 
-    def cast(self, mat):
+    def set_kernel_struct_args(self, mat, launch_ctx, ret_index=()):
+        if self.dtype in primitive_types.integer_types:
+            if is_signed(cook_dtype(self.dtype)):
+                set_arg_func = launch_ctx.set_struct_arg_int
+            else:
+                set_arg_func = launch_ctx.set_struct_arg_uint
+        elif self.dtype in primitive_types.real_types:
+            set_arg_func = launch_ctx.set_struct_arg_float
+        else:
+            raise TaichiRuntimeTypeError(f"Invalid return type on index={ret_index}")
+        if self.ndim == 1:
+            for i in range(self.n):
+                set_arg_func(ret_index + (i,), mat[i])
+        else:
+            for i in range(self.n):
+                for j in range(self.m):
+                    set_arg_func(ret_index + (i * self.m + j,), mat[i, j])
+
+    def set_argpack_struct_args(self, mat, argpack, ret_index=()):
+        if self.dtype in primitive_types.integer_types:
+            if is_signed(cook_dtype(self.dtype)):
+                set_arg_func = argpack.set_arg_int
+            else:
+                set_arg_func = argpack.set_arg_uint
+        elif self.dtype in primitive_types.real_types:
+            set_arg_func = argpack.set_arg_float
+        else:
+            raise TaichiRuntimeTypeError(f"Invalid return type on index={ret_index}")
+        if self.ndim == 1:
+            for i in range(self.n):
+                set_arg_func(ret_index + (i,), mat[i])
+        else:
+            for i in range(self.n):
+                for j in range(self.m):
+                    set_arg_func(ret_index + (i * self.m + j,), mat[i, j])
+
+    def _instantiate_in_python_scope(self, entries):
+        entries = [[entries[k * self.m + i] for i in range(self.m)] for k in range(self.n)]
+        return Matrix(
+            [
+                [
+                    int(entries[i][j]) if self.dtype in primitive_types.integer_types else float(entries[i][j])
+                    for j in range(self.m)
+                ]
+                for i in range(self.n)
+            ],
+            dt=self.dtype,
+        )
+
+    def _instantiate(self, entries):
         if in_python_scope():
-            return Matrix([[
-                int(mat(i, j)) if self.dtype in primitive_types.integer_types
-                else float(mat(i, j)) for j in range(self.m)
-            ] for i in range(self.n)],
-                          ndim=self.ndim)
+            return self._instantiate_in_python_scope(entries)
 
-        if isinstance(mat, impl.Expr) and mat.ptr.is_tensor():
-            return ops_mod.cast(mat, self.dtype)
-
-        if isinstance(mat, Matrix):
-            arr = [[mat(i, j) for j in range(self.m)] for i in range(self.n)]
-            return ops_mod.cast(make_matrix(arr), self.dtype)
-
-        return mat.cast(self.dtype)
-
-    def filled_with_scalar(self, value):
-        return self.cast(
-            Matrix([[value for _ in range(self.m)] for _ in range(self.n)],
-                   ndim=self.ndim))
+        return make_matrix_with_shape(entries, [self.n, self.m], self.dtype)
 
     def field(self, **kwargs):
         assert kwargs.get("ndim", self.ndim) == self.ndim
         kwargs.update({"ndim": self.ndim})
         return Matrix.field(self.n, self.m, dtype=self.dtype, **kwargs)
 
+    def ndarray(self, **kwargs):
+        assert kwargs.get("ndim", self.ndim) == self.ndim
+        kwargs.update({"ndim": self.ndim})
+        return Matrix.ndarray(self.n, self.m, dtype=self.dtype, **kwargs)
+
     def get_shape(self):
         if self.ndim == 1:
-            return (self.n, )
+            return (self.n,)
         return (self.n, self.m)
+
+    def to_string(self):
+        dtype_str = self.dtype.to_string() if self.dtype is not None else ""
+        return f"MatrixType[{self.n},{self.m}, {dtype_str}]"
+
+    def check_matched(self, other):
+        if self.ndim != len(other.shape()):
+            return False
+        if self.dtype is not None and self.dtype != other.element_type():
+            return False
+        shape = self.get_shape()
+        for i in range(self.ndim):
+            if shape[i] is not None and shape[i] != other.shape()[i]:
+                return False
+        return True
 
 
 class VectorType(MatrixType):
@@ -1693,21 +1589,20 @@ class VectorType(MatrixType):
 
         """
         if len(args) == 0:
-            raise TaichiSyntaxError(
-                "Custom type instances need to be created with an initial value."
-            )
+            raise TaichiSyntaxError("Custom type instances need to be created with an initial value.")
         if len(args) == 1:
             # Init from a real Matrix
             if isinstance(args[0], expr.Expr) and args[0].ptr.is_tensor():
                 arg = args[0]
-                shape = arg.ptr.get_ret_type().shape()
+                shape = arg.ptr.get_rvalue_type().shape()
                 assert len(shape) == 1
                 assert self.n == shape[0]
                 return expr.Expr(arg.ptr)
 
             # initialize by a single scalar, e.g. matnxm(1)
             if isinstance(args[0], (numbers.Number, expr.Expr)):
-                return self.filled_with_scalar(args[0])
+                entries = [args[0] for _ in range(self.n)]
+                return self._instantiate(entries)
             args = args[0]
         # collect all input entries to a 1d list and then reshape
         # this is mostly for glsl style like vec4(v.xyz, 1.)
@@ -1718,44 +1613,37 @@ class VectorType(MatrixType):
             elif isinstance(x, np.ndarray):
                 entries += list(x.ravel())
             elif isinstance(x, Matrix):
-                entries += x.entries
-            elif isinstance(x, impl.Expr) and x.ptr.is_tensor():
-                entries += [
-                    impl.Expr(e) for e in impl.get_runtime().prog.
-                    current_ast_builder().expand_expr([x.ptr])
-                ]
+                entries += x.to_list()
             else:
                 entries.append(x)
 
-        if len(entries) != self.n:
-            raise TaichiSyntaxError(
-                f"Incompatible arguments for the custom vector type: ({self.n}), ({len(entries)})"
-            )
-
         #  type cast
-        return self.cast(Vector(entries, dt=self.dtype))
+        return self._instantiate(entries)
 
-    def cast(self, vec):
+    def _instantiate_in_python_scope(self, entries):
+        return Vector(
+            [
+                int(entries[i]) if self.dtype in primitive_types.integer_types else float(entries[i])
+                for i in range(self.n)
+            ],
+            dt=self.dtype,
+        )
+
+    def _instantiate(self, entries):
         if in_python_scope():
-            return Vector([
-                int(vec(i)) if self.dtype in primitive_types.integer_types else
-                float(vec(i)) for i in range(self.n)
-            ])
+            return self._instantiate_in_python_scope(entries)
 
-        if isinstance(vec, impl.Expr) and vec.ptr.is_tensor():
-            return ops_mod.cast(vec, self.dtype)
-
-        if isinstance(vec, Matrix):
-            arr = vec.entries
-            return ops_mod.cast(make_matrix(arr), self.dtype)
-
-        return vec.cast(self.dtype)
-
-    def filled_with_scalar(self, value):
-        return self.cast(Vector([value for _ in range(self.n)]))
+        return make_matrix_with_shape(entries, [self.n], self.dtype)
 
     def field(self, **kwargs):
         return Vector.field(self.n, dtype=self.dtype, **kwargs)
+
+    def ndarray(self, **kwargs):
+        return Vector.ndarray(self.n, dtype=self.dtype, **kwargs)
+
+    def to_string(self):
+        dtype_str = self.dtype.to_string() if self.dtype is not None else ""
+        return f"VectorType[{self.n}, {dtype_str}]"
 
 
 class MatrixNdarray(Ndarray):
@@ -1771,6 +1659,7 @@ class MatrixNdarray(Ndarray):
 
         >>> arr = ti.MatrixNdarray(2, 2, ti.f32, shape=(3, 3))
     """
+
     def __init__(self, n, m, dtype, shape):
         self.n = n
         self.m = m
@@ -1780,10 +1669,15 @@ class MatrixNdarray(Ndarray):
 
         self.layout = Layout.AOS
         self.shape = tuple(shape)
-        self.element_type = TensorType((self.n, self.m), dtype)
+        self.element_type = _type_factory.get_tensor_type((self.n, self.m), self.dtype)
         # TODO: we should pass in element_type, shape, layout instead.
         self.arr = impl.get_runtime().prog.create_ndarray(
-            cook_dtype(self.element_type.ptr), shape, Layout.AOS)
+            cook_dtype(self.element_type),
+            shape,
+            Layout.AOS,
+            zero_fill=True,
+            dbg_info=ti_python_core.DebugInfo(get_traceback()),
+        )
 
     @property
     def element_shape(self):
@@ -1809,11 +1703,8 @@ class MatrixNdarray(Ndarray):
 
     @python_scope
     def __getitem__(self, key):
-        key = () if key is None else (
-            key, ) if isinstance(key, numbers.Number) else tuple(key)
-        return Matrix(
-            [[NdarrayHostAccess(self, key, (i, j)) for j in range(self.m)]
-             for i in range(self.n)])
+        key = () if key is None else (key,) if isinstance(key, numbers.Number) else tuple(key)
+        return Matrix([[NdarrayHostAccess(self, key, (i, j)) for j in range(self.m)] for i in range(self.n)])
 
     @python_scope
     def to_numpy(self):
@@ -1851,13 +1742,25 @@ class MatrixNdarray(Ndarray):
 
     @python_scope
     def _fill_by_kernel(self, val):
-        from taichi._kernels import \
-            fill_ndarray_matrix  # pylint: disable=C0415
-        fill_ndarray_matrix(self, val)
+        from taichi._kernels import fill_ndarray_matrix  # pylint: disable=C0415
+
+        shape = self.element_type.shape()
+        n = shape[0]
+        m = 1
+        if len(shape) > 1:
+            m = shape[1]
+
+        prim_dtype = self.element_type.element_type()
+        matrix_type = MatrixType(n, m, len(shape), prim_dtype)
+        if isinstance(val, Matrix):
+            value = val
+        else:
+            value = matrix_type(val)
+        fill_ndarray_matrix(self, value)
 
     @python_scope
     def __repr__(self):
-        return f'<{self.n}x{self.m} {Layout.AOS} ti.Matrix.ndarray>'
+        return f"<{self.n}x{self.m} {Layout.AOS} ti.Matrix.ndarray>"
 
 
 class VectorNdarray(Ndarray):
@@ -1867,12 +1770,12 @@ class VectorNdarray(Ndarray):
         n (int): Size of the vector.
         dtype (DataType): Data type of each value.
         shape (Tuple[int]): Shape of the ndarray.
-        layout (Layout): Memory layout.
 
     Example::
 
         >>> a = ti.VectorNdarray(3, ti.f32, (3, 3))
     """
+
     def __init__(self, n, dtype, shape):
         self.n = n
         super().__init__()
@@ -1881,9 +1784,14 @@ class VectorNdarray(Ndarray):
 
         self.layout = Layout.AOS
         self.shape = tuple(shape)
-        self.element_type = TensorType((n, ), self.dtype)
+        self.element_type = _type_factory.get_tensor_type((n,), self.dtype)
         self.arr = impl.get_runtime().prog.create_ndarray(
-            cook_dtype(self.element_type.ptr), shape, Layout.AOS)
+            cook_dtype(self.element_type),
+            shape,
+            Layout.AOS,
+            zero_fill=True,
+            dbg_info=ti_python_core.DebugInfo(get_traceback()),
+        )
 
     @property
     def element_shape(self):
@@ -1906,10 +1814,8 @@ class VectorNdarray(Ndarray):
 
     @python_scope
     def __getitem__(self, key):
-        key = () if key is None else (
-            key, ) if isinstance(key, numbers.Number) else tuple(key)
-        return Vector(
-            [NdarrayHostAccess(self, key, (i, )) for i in range(self.n)])
+        key = () if key is None else (key,) if isinstance(key, numbers.Number) else tuple(key)
+        return Vector([NdarrayHostAccess(self, key, (i,)) for i in range(self.n)])
 
     @python_scope
     def to_numpy(self):
@@ -1950,13 +1856,20 @@ class VectorNdarray(Ndarray):
 
     @python_scope
     def _fill_by_kernel(self, val):
-        from taichi._kernels import \
-            fill_ndarray_matrix  # pylint: disable=C0415
-        fill_ndarray_matrix(self, val)
+        from taichi._kernels import fill_ndarray_matrix  # pylint: disable=C0415
+
+        shape = self.element_type.shape()
+        prim_dtype = self.element_type.element_type()
+        vector_type = VectorType(shape[0], prim_dtype)
+        if isinstance(val, Vector):
+            value = val
+        else:
+            value = vector_type(val)
+        fill_ndarray_matrix(self, value)
 
     @python_scope
     def __repr__(self):
-        return f'<{self.n} {Layout.AOS} ti.Vector.ndarray>'
+        return f"<{self.n} {Layout.AOS} ti.Vector.ndarray>"
 
 
 __all__ = ["Matrix", "Vector", "MatrixField", "MatrixNdarray", "VectorNdarray"]

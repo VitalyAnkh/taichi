@@ -3,7 +3,7 @@
     The use of this software is governed by the LICENSE file.
 *******************************************************************************/
 
-#include "taichi/runtime/metal/api.h"
+#include "taichi/rhi/metal/metal_api.h"
 #include "taichi/runtime/gfx/runtime.h"
 #include "taichi/rhi/dx/dx_api.h"
 #include "taichi/common/core.h"
@@ -16,11 +16,16 @@
 #include "taichi/python/export.h"
 #include "taichi/python/memory_usage_monitor.h"
 #include "taichi/system/benchmark.h"
-#include "taichi/system/dynamic_loader.h"
 #include "taichi/system/hacked_signal_handler.h"
 #include "taichi/system/profiler.h"
+#include "taichi/util/offline_cache.h"
 #if defined(TI_WITH_CUDA)
 #include "taichi/rhi/cuda/cuda_driver.h"
+#endif
+
+#include "taichi/platform/amdgpu/detect_amdgpu.h"
+#if defined(TI_WITH_AMDGPU)
+#include "taichi/rhi/amdgpu/amdgpu_driver.h"
 #endif
 
 #ifdef TI_WITH_VULKAN
@@ -33,12 +38,6 @@
 
 #ifdef TI_WITH_DX12
 #include "taichi/rhi/dx12/dx12_api.h"
-#endif
-
-#ifdef TI_WITH_CC
-namespace taichi::lang::cccp {
-extern bool is_c_backend_available();
-}
 #endif
 
 namespace taichi {
@@ -143,6 +142,7 @@ void export_misc(py::module &m) {
   m.def("pop_python_print_buffer", []() { return py_cout.pop_content(); });
   m.def("toggle_python_print_buffer", [](bool opt) { py_cout.enabled = opt; });
   m.def("with_cuda", is_cuda_api_available);
+  m.def("with_amdgpu", is_rocm_api_available);
 #ifdef TI_WITH_METAL
   m.def("with_metal", taichi::lang::metal::is_metal_api_available);
 #else
@@ -172,11 +172,8 @@ void export_misc(py::module &m) {
   m.def("with_dx12", []() { return false; });
 #endif
 
-#ifdef TI_WITH_CC
-  m.def("with_cc", taichi::lang::cccp::is_c_backend_available);
-#else
-  m.def("with_cc", []() { return false; });
-#endif
+  m.def("clean_offline_cache_files",
+        lang::offline_cache::clean_offline_cache_files);
 
   py::class_<HackedSignalRegister>(m, "HackedSignalRegister").def(py::init<>());
 }

@@ -26,7 +26,10 @@ class CUDAContext {
   std::mutex lock_;
   KernelProfilerBase *profiler_;
   CUDADriver &driver_;
+  int max_shared_memory_bytes_;
   bool debug_;
+  bool supports_mem_pool_;
+  void *stream_;
 
  public:
   CUDAContext();
@@ -42,6 +45,7 @@ class CUDAContext {
   void launch(void *func,
               const std::string &task_name,
               std::vector<void *> arg_pointers,
+              std::vector<int> arg_sizes,
               unsigned grid_dim,
               unsigned block_dim,
               std::size_t dynamic_shared_mem_bytes);
@@ -68,6 +72,10 @@ class CUDAContext {
 
   int get_compute_capability() const {
     return compute_capability_;
+  }
+
+  bool supports_mem_pool() const {
+    return supports_mem_pool_;
   }
 
   ~CUDAContext();
@@ -101,6 +109,14 @@ class CUDAContext {
   }
 
   static CUDAContext &get_instance();
+
+  void set_stream(void *stream) {
+    stream_ = stream;
+  }
+
+  void *get_stream() const {
+    return stream_;
+  }
 };
 
 }  // namespace taichi::lang

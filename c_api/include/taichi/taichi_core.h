@@ -9,14 +9,15 @@
 //
 // Taichi C-API intends to support the following backends:
 //
-// |Backend     |Offload Target   |Maintenance Tier |
-// |------------|-----------------|-----------------|
-// |Vulkan      |GPU              |Tier 1           |
-// |CUDA (LLVM) |GPU (NVIDIA)     |Tier 1           |
-// |CPU (LLVM)  |CPU              |Tier 1           |
-// |OpenGL      |GPU              |Tier 2           |
-// |DirectX 11  |GPU (Windows)    |N/A              |
-// |Metal       |GPU (macOS, iOS) |N/A              |
+// |Backend     |Offload Target   |Maintenance Tier | Stabilized? |
+// |------------|-----------------|-----------------|-------------|
+// |Vulkan      |GPU              |Tier 1           | Yes         |
+// |Metal       |GPU (macOS, iOS) |Tier 2           | No          |
+// |CUDA (LLVM) |GPU (NVIDIA)     |Tier 2           | No          |
+// |CPU (LLVM)  |CPU              |Tier 2           | No          |
+// |OpenGL      |GPU              |Tier 2           | No          |
+// |OpenGL ES   |GPU              |Tier 2           | No          |
+// |DirectX 11  |GPU (Windows)    |N/A              | No          |
 //
 // The backends with tier-1 support are being developed and tested more
 // intensively. And most new features will be available on Vulkan first because
@@ -48,7 +49,8 @@
 // any problem with runtime instance coexistence.
 //
 // ```cpp
-// TiRuntime runtime = ti_create_runtime(TI_ARCH_VULKAN);
+// // Create a Taichi Runtime on Vulkan device at index 0.
+// TiRuntime runtime = ti_create_runtime(TI_ARCH_VULKAN, 0);
 // ```
 //
 // When your program runs to the end, ensure that:
@@ -140,11 +142,11 @@
 // ```
 //
 // `/path/to/aot/module` should point to the directory that contains a
-// `metadata.tcb`.
+// `metadata.json`.
 //
 // You can destroy an unused AOT module, but please ensure that there is no
 // kernel or compute graph related to it pending to
-// [`ti_submit`](#function-ti_submit).
+// [`ti_flush`](#function-ti_flush).
 //
 // ```cpp
 // ti_destroy_aot_module(aot_module);
@@ -211,11 +213,11 @@
 // ```
 //
 // When you have launched all kernels and compute graphs for this batch, you
-// should [`ti_submit`](#function-ti_submit) and [`ti_wait`](#function-ti_wait)
+// should [`ti_flush`](#function-ti_flush) and [`ti_wait`](#function-ti_wait)
 // for the execution to finish.
 //
 // ```cpp
-// ti_submit(runtime);
+// ti_flush(runtime);
 // ti_wait(runtime);
 // ```
 //
@@ -225,33 +227,35 @@
 #pragma once
 
 #ifndef TI_C_API_VERSION
-#define TI_C_API_VERSION 1000002
+#define TI_C_API_VERSION 1007000
 #endif  // TI_C_API_VERSION
 
-#include <taichi/taichi.h>
+#ifndef TAICHI_H
+#include "taichi.h"
+#endif  // TAICHI_H
 
 #ifdef __cplusplus
 extern "C" {
 #endif  // __cplusplus
 
-// Alias `TiBool`
+// Alias `TiBool` (1.4.0)
 //
 // A boolean value. Can be either [`TI_TRUE`](#definition-ti_true) or
 // [`TI_FALSE`](#definition-ti_false). Assignment with other values could lead
 // to undefined behavior.
 typedef uint32_t TiBool;
 
-// Definition `TI_FALSE`
+// Definition `TI_FALSE` (1.4.0)
 //
 // A condition or a predicate is not satisfied; a statement is invalid.
 #define TI_FALSE 0
 
-// Definition `TI_TRUE`
+// Definition `TI_TRUE` (1.4.0)
 //
 // A condition or a predicate is satisfied; a statement is valid.
 #define TI_TRUE 1
 
-// Alias `TiFlags`
+// Alias `TiFlags` (1.4.0)
 //
 // A bit field that can be used to represent 32 orthogonal flags. Bits
 // unspecified in the corresponding flag enum are ignored.
@@ -261,13 +265,13 @@ typedef uint32_t TiBool;
 // semantical impact and can be safely ignored.
 typedef uint32_t TiFlags;
 
-// Definition `TI_NULL_HANDLE`
+// Definition `TI_NULL_HANDLE` (1.4.0)
 //
 // A sentinal invalid handle that will never be produced from a valid call to
 // Taichi C-API.
 #define TI_NULL_HANDLE 0
 
-// Handle `TiRuntime`
+// Handle `TiRuntime` (1.4.0)
 //
 // Taichi runtime represents an instance of a logical backend and its internal
 // dynamic state. The user is responsible to synchronize any use of
@@ -275,24 +279,18 @@ typedef uint32_t TiFlags;
 // [`TiRuntime`](#handle-tiruntime)s in the same thread.
 typedef struct TiRuntime_t *TiRuntime;
 
-// Handle `TiAotModule`
+// Handle `TiAotModule` (1.4.0)
 //
 // An ahead-of-time (AOT) compiled Taichi module, which contains a collection of
 // kernels and compute graphs.
 typedef struct TiAotModule_t *TiAotModule;
 
-// Handle `TiEvent`
-//
-// A synchronization primitive to manage device execution flows in multiple
-// queues.
-typedef struct TiEvent_t *TiEvent;
-
-// Handle `TiMemory`
+// Handle `TiMemory` (1.4.0)
 //
 // A contiguous allocation of device memory.
 typedef struct TiMemory_t *TiMemory;
 
-// Handle `TiImage`
+// Handle `TiImage` (1.4.0)
 //
 // A contiguous allocation of device image.
 typedef struct TiImage_t *TiImage;
@@ -304,18 +302,18 @@ typedef struct TiImage_t *TiImage;
 // modes and address modes of default samplers depend on backend implementation.
 typedef struct TiSampler_t *TiSampler;
 
-// Handle `TiKernel`
+// Handle `TiKernel` (1.4.0)
 //
 // A Taichi kernel that can be launched on the offload target for execution.
 typedef struct TiKernel_t *TiKernel;
 
-// Handle `TiComputeGraph`
+// Handle `TiComputeGraph` (1.4.0)
 //
 // A collection of Taichi kernels (a compute graph) to launch on the offload
 // target in a predefined order.
 typedef struct TiComputeGraph_t *TiComputeGraph;
 
-// Enumeration `TiError`
+// Enumeration `TiError` (1.4.0)
 //
 // Errors reported by the Taichi C-API.
 typedef enum TiError {
@@ -354,32 +352,31 @@ typedef enum TiError {
   TI_ERROR_MAX_ENUM = 0xffffffff,
 } TiError;
 
-// Enumeration `TiArch`
+// Enumeration `TiArch` (1.4.0)
 //
 // Types of backend archs.
 typedef enum TiArch {
-  // x64 native CPU backend.
-  TI_ARCH_X64 = 0,
-  // Arm64 native CPU backend.
-  TI_ARCH_ARM64 = 1,
-  TI_ARCH_JS = 2,
-  TI_ARCH_CC = 3,
-  TI_ARCH_WASM = 4,
-  // NVIDIA CUDA GPU backend.
-  TI_ARCH_CUDA = 5,
-  TI_ARCH_METAL = 6,
-  // OpenGL GPU backend.
-  TI_ARCH_OPENGL = 7,
-  TI_ARCH_DX11 = 8,
-  TI_ARCH_DX12 = 9,
-  TI_ARCH_OPENCL = 10,
-  TI_ARCH_AMDGPU = 11,
+  TI_ARCH_RESERVED = 0,
   // Vulkan GPU backend.
-  TI_ARCH_VULKAN = 12,
+  TI_ARCH_VULKAN = 1,
+  // Metal GPU backend.
+  TI_ARCH_METAL = 2,
+  // NVIDIA CUDA GPU backend.
+  TI_ARCH_CUDA = 3,
+  // x64 native CPU backend.
+  TI_ARCH_X64 = 4,
+  // Arm64 native CPU backend.
+  TI_ARCH_ARM64 = 5,
+  // OpenGL GPU backend.
+  TI_ARCH_OPENGL = 6,
+  // OpenGL ES GPU backend.
+  TI_ARCH_GLES = 7,
   TI_ARCH_MAX_ENUM = 0xffffffff,
 } TiArch;
 
-// Enumeration `TiCapability`
+// Enumeration `TiCapability` (1.4.0)
+//
+// Device capabilities.
 typedef enum TiCapability {
   TI_CAPABILITY_RESERVED = 0,
   TI_CAPABILITY_SPIRV_VERSION = 1,
@@ -388,7 +385,7 @@ typedef enum TiCapability {
   TI_CAPABILITY_SPIRV_HAS_INT64 = 4,
   TI_CAPABILITY_SPIRV_HAS_FLOAT16 = 5,
   TI_CAPABILITY_SPIRV_HAS_FLOAT64 = 6,
-  TI_CAPABILITY_SPIRV_HAS_ATOMIC_I64 = 7,
+  TI_CAPABILITY_SPIRV_HAS_ATOMIC_INT64 = 7,
   TI_CAPABILITY_SPIRV_HAS_ATOMIC_FLOAT16 = 8,
   TI_CAPABILITY_SPIRV_HAS_ATOMIC_FLOAT16_ADD = 9,
   TI_CAPABILITY_SPIRV_HAS_ATOMIC_FLOAT16_MINMAX = 10,
@@ -409,13 +406,16 @@ typedef enum TiCapability {
   TI_CAPABILITY_MAX_ENUM = 0xffffffff,
 } TiCapability;
 
-// Structure `TiCapabilityLevelInfo`
+// Structure `TiCapabilityLevelInfo` (1.4.0)
+//
+// An integral device capability level. It currently is not guaranteed that a
+// higher level value is compatible with a lower level value.
 typedef struct TiCapabilityLevelInfo {
   TiCapability capability;
   uint32_t level;
 } TiCapabilityLevelInfo;
 
-// Enumeration `TiDataType`
+// Enumeration `TiDataType` (1.4.0)
 //
 // Elementary (primitive) data types. There might be vendor-specific constraints
 // on the available data types so it's recommended to use 32-bit data types if
@@ -449,7 +449,7 @@ typedef enum TiDataType {
   TI_DATA_TYPE_MAX_ENUM = 0xffffffff,
 } TiDataType;
 
-// Enumeration `TiArgumentType`
+// Enumeration `TiArgumentType` (1.4.0)
 //
 // Types of kernel and compute graph argument.
 typedef enum TiArgumentType {
@@ -461,10 +461,14 @@ typedef enum TiArgumentType {
   TI_ARGUMENT_TYPE_NDARRAY = 2,
   // Texture wrapped around a `handle.image`.
   TI_ARGUMENT_TYPE_TEXTURE = 3,
+  // Typed scalar.
+  TI_ARGUMENT_TYPE_SCALAR = 4,
+  // Typed tensor.
+  TI_ARGUMENT_TYPE_TENSOR = 5,
   TI_ARGUMENT_TYPE_MAX_ENUM = 0xffffffff,
 } TiArgumentType;
 
-// BitField `TiMemoryUsageFlags`
+// BitField `TiMemoryUsageFlags` (1.4.0)
 //
 // Usages of a memory allocation. Taichi requires kernel argument memories to be
 // allocated with `TI_MEMORY_USAGE_STORAGE_BIT`.
@@ -480,7 +484,7 @@ typedef enum TiMemoryUsageFlagBits {
 } TiMemoryUsageFlagBits;
 typedef TiFlags TiMemoryUsageFlags;
 
-// Structure `TiMemoryAllocateInfo`
+// Structure `TiMemoryAllocateInfo` (1.4.0)
 //
 // Parameters of a newly allocated memory.
 typedef struct TiMemoryAllocateInfo {
@@ -498,7 +502,7 @@ typedef struct TiMemoryAllocateInfo {
   TiMemoryUsageFlags usage;
 } TiMemoryAllocateInfo;
 
-// Structure `TiMemorySlice`
+// Structure `TiMemorySlice` (1.4.0)
 //
 // A subsection of a memory allocation. The sum of `offset` and `size` cannot
 // exceed the size of `memory`.
@@ -511,7 +515,7 @@ typedef struct TiMemorySlice {
   uint64_t size;
 } TiMemorySlice;
 
-// Structure `TiNdShape`
+// Structure `TiNdShape` (1.4.0)
 //
 // Multi-dimensional size of an ND-array. Dimension sizes after `dim_count` are
 // ignored.
@@ -522,7 +526,7 @@ typedef struct TiNdShape {
   uint32_t dims[16];
 } TiNdShape;
 
-// Structure `TiNdArray`
+// Structure `TiNdArray` (1.4.0)
 //
 // Multi-dimensional array of dense primitive data.
 typedef struct TiNdArray {
@@ -537,7 +541,7 @@ typedef struct TiNdArray {
   TiDataType elem_type;
 } TiNdArray;
 
-// BitField `TiImageUsageFlags`
+// BitField `TiImageUsageFlags` (1.4.0)
 //
 // Usages of an image allocation. Taichi requires kernel argument images to be
 // allocated with `TI_IMAGE_USAGE_STORAGE_BIT` and `TI_IMAGE_USAGE_SAMPLED_BIT`.
@@ -552,7 +556,7 @@ typedef enum TiImageUsageFlagBits {
 } TiImageUsageFlagBits;
 typedef TiFlags TiImageUsageFlags;
 
-// Enumeration `TiImageDimension`
+// Enumeration `TiImageDimension` (1.4.0)
 //
 // Dimensions of an image allocation.
 typedef enum TiImageDimension {
@@ -572,7 +576,7 @@ typedef enum TiImageDimension {
   TI_IMAGE_DIMENSION_MAX_ENUM = 0xffffffff,
 } TiImageDimension;
 
-// Enumeration `TiImageLayout`
+// Enumeration `TiImageLayout` (1.4.0)
 typedef enum TiImageLayout {
   // Undefined layout. An image in this layout does not contain any semantical
   // information.
@@ -600,7 +604,10 @@ typedef enum TiImageLayout {
   TI_IMAGE_LAYOUT_MAX_ENUM = 0xffffffff,
 } TiImageLayout;
 
-// Enumeration `TiFormat`
+// Enumeration `TiFormat` (1.4.0)
+//
+// Texture formats. The availability of texture formats depends on runtime
+// support.
 typedef enum TiFormat {
   TI_FORMAT_UNKNOWN = 0,
   TI_FORMAT_R8 = 1,
@@ -649,7 +656,7 @@ typedef enum TiFormat {
   TI_FORMAT_MAX_ENUM = 0xffffffff,
 } TiFormat;
 
-// Structure `TiImageOffset`
+// Structure `TiImageOffset` (1.4.0)
 //
 // Offsets of an image in X, Y, Z, and array layers.
 typedef struct TiImageOffset {
@@ -671,7 +678,7 @@ typedef struct TiImageOffset {
   uint32_t array_layer_offset;
 } TiImageOffset;
 
-// Structure `TiImageExtent`
+// Structure `TiImageExtent` (1.4.0)
 //
 // Extents of an image in X, Y, Z, and array layers.
 typedef struct TiImageExtent {
@@ -694,7 +701,7 @@ typedef struct TiImageExtent {
   uint32_t array_layer_count;
 } TiImageExtent;
 
-// Structure `TiImageAllocateInfo`
+// Structure `TiImageAllocateInfo` (1.4.0)
 //
 // Parameters of a newly allocated image.
 typedef struct TiImageAllocateInfo {
@@ -714,7 +721,7 @@ typedef struct TiImageAllocateInfo {
   TiImageUsageFlags usage;
 } TiImageAllocateInfo;
 
-// Structure `TiImageSlice`
+// Structure `TiImageSlice` (1.4.0)
 //
 // A subsection of a memory allocation. The sum of `offset` and `extent` in each
 // dimension cannot exceed the size of `image`.
@@ -752,7 +759,7 @@ typedef struct TiSamplerCreateInfo {
   float max_anisotropy;
 } TiSamplerCreateInfo;
 
-// Structure `TiTexture`
+// Structure `TiTexture` (1.4.0)
 //
 // Image data bound to a sampler.
 typedef struct TiTexture {
@@ -769,21 +776,85 @@ typedef struct TiTexture {
   TiFormat format;
 } TiTexture;
 
-// Union `TiArgumentValue`
+// Union `TiScalarValue` (1.5.0)
+//
+// Scalar value represented by a power-of-two number of bits.
+//
+// **NOTE** The unsigned integer types merely hold the number of bits in memory
+// and doesn't reflect any type of the underlying data. For example, a 32-bit
+// floating-point scalar value is assigned by `*(float*)&scalar_value.x32 =
+// 0.0f`; a 16-bit signed integer is assigned by `*(int16_t)&scalar_vaue.x16 =
+// 1`. The actual type of the scalar is hinted via `type`.
+typedef union TiScalarValue {
+  // Scalar value that fits into 8 bits.
+  uint8_t x8;
+  // Scalar value that fits into 16 bits.
+  uint16_t x16;
+  // Scalar value that fits into 32 bits.
+  uint32_t x32;
+  // Scalar value that fits into 64 bits.
+  uint64_t x64;
+} TiScalarValue;
+
+// Structure `TiScalar` (1.5.0)
+//
+// A typed scalar value.
+typedef struct TiScalar {
+  TiDataType type;
+  TiScalarValue value;
+} TiScalar;
+
+// Union `TiTensorValue`
+//
+// Tensor value represented by a power-of-two number of bits.
+typedef union TiTensorValue {
+  // Tensor value that fits into 8 bits.
+  uint8_t x8[128];
+  // Tensor value that fits into 16 bits.
+  uint16_t x16[64];
+  // Tensor value that fits into 32 bits.
+  uint32_t x32[32];
+  // Tensor value that fits into 64 bits.
+  uint64_t x64[16];
+} TiTensorValue;
+
+// Structure `TiTensorValueWithLength`
+//
+// A tensor value with a length.
+typedef struct TiTensorValueWithLength {
+  uint32_t length;
+  TiTensorValue data;
+} TiTensorValueWithLength;
+
+// Structure `TiTensor`
+//
+// A typed tensor value.
+typedef struct TiTensor {
+  TiDataType type;
+  TiTensorValueWithLength contents;
+} TiTensor;
+
+// Union `TiArgumentValue` (1.4.0)
 //
 // A scalar or structured argument value.
 typedef union TiArgumentValue {
-  // Value of a 32-bit one's complement signed integer.
+  // Value of a 32-bit one's complement signed integer. This is equivalent to
+  // `union.scalar_value.x32` with `enumeration.data_type.i32`.
   int32_t i32;
-  // Value of a 32-bit IEEE 754 single-precision floating-poing number.
+  // Value of a 32-bit IEEE 754 single-precision floating-poing number. This is
+  // equivalent to `union.scalar_value.x32` with `enumeration.data_type.f32`.
   float f32;
   // An ND-array to be bound.
   TiNdArray ndarray;
   // A texture to be bound.
   TiTexture texture;
+  // An scalar to be bound.
+  TiScalar scalar;
+  // A tensor to be bound.
+  TiTensor tensor;
 } TiArgumentValue;
 
-// Structure `TiArgument`
+// Structure `TiArgument` (1.4.0)
 //
 // An argument value to feed kernels.
 typedef struct TiArgument {
@@ -793,7 +864,7 @@ typedef struct TiArgument {
   TiArgumentValue value;
 } TiArgument;
 
-// Structure `TiNamedArgument`
+// Structure `TiNamedArgument` (1.4.0)
 //
 // A named argument value to feed compute graphs.
 typedef struct TiNamedArgument {
@@ -803,7 +874,13 @@ typedef struct TiNamedArgument {
   TiArgument argument;
 } TiNamedArgument;
 
-// Function `ti_get_available_archs`
+// Function `ti_get_version` (1.4.0)
+//
+// Get the current taichi version. It has the same value as `TI_C_API_VERSION`
+// as defined in `taichi_core.h`.
+TI_DLL_EXPORT uint32_t TI_API_CALL ti_get_version();
+
+// Function `ti_get_available_archs` (1.4.0)
 //
 // Gets a list of available archs on the current platform. An arch is only
 // available if:
@@ -816,21 +893,23 @@ typedef struct TiNamedArgument {
 // always available. If an arch is not available on the current platform, a call
 // to [`ti_create_runtime`](#function-ti_create_runtime) with that arch is
 // guaranteed failing.
+//
+// **WARNING** Please also note that the order or returned archs is *undefined*.
 TI_DLL_EXPORT void TI_API_CALL ti_get_available_archs(uint32_t *arch_count,
                                                       TiArch *archs);
 
-// Function `ti_get_last_error`
+// Function `ti_get_last_error` (1.4.0)
 //
 // Gets the last error raised by Taichi C-API invocations. Returns the
 // semantical error code.
 TI_DLL_EXPORT TiError TI_API_CALL ti_get_last_error(
     // Size of textual error message in `function.get_last_error.message`
-    uint64_t message_size,
+    uint64_t *message_size,
     // Text buffer for the textual error message. Ignored when `message_size` is
     // 0.
     char *message);
 
-// Function `ti_set_last_error`
+// Function `ti_set_last_error` (1.4.0)
 //
 // Sets the provided error as the last error raised by Taichi C-API invocations.
 // It can be useful in extended validation procedures in Taichi C-API wrappers
@@ -842,23 +921,30 @@ TI_DLL_EXPORT void TI_API_CALL ti_set_last_error(
     // empty error message.
     const char *message);
 
-// Function `ti_create_runtime`
+// Function `ti_create_runtime` (1.4.0)
 //
 // Creates a Taichi Runtime with the specified [`TiArch`](#enumeration-tiarch).
-TI_DLL_EXPORT TiRuntime TI_API_CALL ti_create_runtime(TiArch arch);
+TI_DLL_EXPORT TiRuntime TI_API_CALL ti_create_runtime(
+    // Arch of Taichi Runtime.
+    TiArch arch,
+    // The index of device in `function.create_runtime.arch` to create Taichi
+    // Runtime on.
+    uint32_t device_index);
 
-// Function `ti_destroy_runtime`
+// Function `ti_destroy_runtime` (1.4.0)
 //
 // Destroys a Taichi Runtime.
 TI_DLL_EXPORT void TI_API_CALL ti_destroy_runtime(TiRuntime runtime);
 
-// Function `ti_set_runtime_capabilities_ext`
+// Function `ti_set_runtime_capabilities_ext` (1.4.0)
+//
+// Force override the list of available capabilities in the runtime instance.
 TI_DLL_EXPORT void TI_API_CALL
 ti_set_runtime_capabilities_ext(TiRuntime runtime,
                                 uint32_t capability_count,
                                 const TiCapabilityLevelInfo *capabilities);
 
-// Function `ti_get_runtime_capabilities`
+// Function `ti_get_runtime_capabilities` (1.4.0)
 //
 // Gets all capabilities available on the runtime instance.
 TI_DLL_EXPORT void TI_API_CALL
@@ -868,27 +954,27 @@ ti_get_runtime_capabilities(TiRuntime runtime,
                             // Returned capabilities.
                             TiCapabilityLevelInfo *capabilities);
 
-// Function `ti_allocate_memory`
+// Function `ti_allocate_memory` (1.4.0)
 //
 // Allocates a contiguous device memory with provided parameters.
 TI_DLL_EXPORT TiMemory TI_API_CALL
 ti_allocate_memory(TiRuntime runtime,
                    const TiMemoryAllocateInfo *allocate_info);
 
-// Function `ti_free_memory`
+// Function `ti_free_memory` (1.4.0)
 //
 // Frees a memory allocation.
 TI_DLL_EXPORT void TI_API_CALL ti_free_memory(TiRuntime runtime,
                                               TiMemory memory);
 
-// Function `ti_map_memory`
+// Function `ti_map_memory` (1.4.0)
 //
 // Maps a device memory to a host-addressable space. You *must* ensure that the
 // device is not being used by any device command before the mapping.
 TI_DLL_EXPORT void *TI_API_CALL ti_map_memory(TiRuntime runtime,
                                               TiMemory memory);
 
-// Function `ti_unmap_memory`
+// Function `ti_unmap_memory` (1.4.0)
 //
 // Unmaps a device memory and makes any host-side changes about the memory
 // visible to the device. You *must* ensure that there is no further access to
@@ -896,13 +982,13 @@ TI_DLL_EXPORT void *TI_API_CALL ti_map_memory(TiRuntime runtime,
 TI_DLL_EXPORT void TI_API_CALL ti_unmap_memory(TiRuntime runtime,
                                                TiMemory memory);
 
-// Function `ti_allocate_image`
+// Function `ti_allocate_image` (1.4.0)
 //
 // Allocates a device image with provided parameters.
 TI_DLL_EXPORT TiImage TI_API_CALL
 ti_allocate_image(TiRuntime runtime, const TiImageAllocateInfo *allocate_info);
 
-// Function `ti_free_image`
+// Function `ti_free_image` (1.4.0)
 //
 // Frees an image allocation.
 TI_DLL_EXPORT void TI_API_CALL ti_free_image(TiRuntime runtime, TiImage image);
@@ -915,17 +1001,7 @@ ti_create_sampler(TiRuntime runtime, const TiSamplerCreateInfo *create_info);
 TI_DLL_EXPORT void TI_API_CALL ti_destroy_sampler(TiRuntime runtime,
                                                   TiSampler sampler);
 
-// Function `ti_create_event`
-//
-// Creates an event primitive.
-TI_DLL_EXPORT TiEvent TI_API_CALL ti_create_event(TiRuntime runtime);
-
-// Function `ti_destroy_event`
-//
-// Destroys an event primitive.
-TI_DLL_EXPORT void TI_API_CALL ti_destroy_event(TiEvent event);
-
-// Function `ti_copy_memory_device_to_device` (Device Command)
+// Function `ti_copy_memory_device_to_device` (Device Command) (1.4.0)
 //
 // Copies the data in a contiguous subsection of the device memory to another
 // subsection. The two subsections *must not* overlap.
@@ -943,7 +1019,7 @@ ti_copy_image_device_to_device(TiRuntime runtime,
                                const TiImageSlice *dst_image,
                                const TiImageSlice *src_image);
 
-// Function `ti_track_image_ext`
+// Function `ti_track_image_ext` (1.4.0)
 //
 // Tracks the device image with the provided image layout. Because Taichi tracks
 // image layouts internally, it is *only* useful to inform Taichi that the image
@@ -952,7 +1028,7 @@ TI_DLL_EXPORT void TI_API_CALL ti_track_image_ext(TiRuntime runtime,
                                                   TiImage image,
                                                   TiImageLayout layout);
 
-// Function `ti_transition_image` (Device Command)
+// Function `ti_transition_image` (Device Command) (1.4.0)
 //
 // Transitions the image to the provided image layout. Because Taichi tracks
 // image layouts internally, it is *only* useful to enforce an image layout for
@@ -961,7 +1037,7 @@ TI_DLL_EXPORT void TI_API_CALL ti_transition_image(TiRuntime runtime,
                                                    TiImage image,
                                                    TiImageLayout layout);
 
-// Function `ti_launch_kernel` (Device Command)
+// Function `ti_launch_kernel` (Device Command) (1.4.0)
 //
 // Launches a Taichi kernel with the provided arguments. The arguments *must*
 // have the same count and types in the same order as in the source code.
@@ -970,7 +1046,7 @@ TI_DLL_EXPORT void TI_API_CALL ti_launch_kernel(TiRuntime runtime,
                                                 uint32_t arg_count,
                                                 const TiArgument *args);
 
-// Function `ti_launch_compute_graph` (Device Command)
+// Function `ti_launch_compute_graph` (Device Command) (1.4.0)
 //
 // Launches a Taichi compute graph with provided named arguments. The named
 // arguments *must* have the same count, names, and types as in the source code.
@@ -980,41 +1056,19 @@ ti_launch_compute_graph(TiRuntime runtime,
                         uint32_t arg_count,
                         const TiNamedArgument *args);
 
-// Function `ti_signal_event` (Device Command)
-//
-// Sets an event primitive to a signaled state so that the queues waiting for it
-// can go on execution. If the event has been signaled, you *must* call
-// [`ti_reset_event`](#function-ti_reset_event-device-command) to reset it;
-// otherwise, an undefined behavior would occur.
-TI_DLL_EXPORT void TI_API_CALL ti_signal_event(TiRuntime runtime,
-                                               TiEvent event);
-
-// Function `ti_reset_event` (Device Command)
-//
-// Sets a signaled event primitive back to an unsignaled state.
-TI_DLL_EXPORT void TI_API_CALL ti_reset_event(TiRuntime runtime, TiEvent event);
-
-// Function `ti_wait_event` (Device Command)
-//
-// Waits until an event primitive transitions to a signaled state. The awaited
-// event *must* be signaled by an external procedure or a previous invocation to
-// [`ti_reset_event`](#function-ti_reset_event-device-command); otherwise, an
-// undefined behavior would occur.
-TI_DLL_EXPORT void TI_API_CALL ti_wait_event(TiRuntime runtime, TiEvent event);
-
-// Function `ti_submit`
+// Function `ti_flush` (1.4.0)
 //
 // Submits all previously invoked device commands to the offload device for
 // execution.
-TI_DLL_EXPORT void TI_API_CALL ti_submit(TiRuntime runtime);
+TI_DLL_EXPORT void TI_API_CALL ti_flush(TiRuntime runtime);
 
-// Function `ti_wait`
+// Function `ti_wait` (1.4.0)
 //
 // Waits until all previously invoked device commands are executed. Any invoked
 // command that has not been submitted is submitted first.
 TI_DLL_EXPORT void TI_API_CALL ti_wait(TiRuntime runtime);
 
-// Function `ti_load_aot_module`
+// Function `ti_load_aot_module` (1.4.0)
 //
 // Loads a pre-compiled AOT module from the file system.
 // Returns [`TI_NULL_HANDLE`](#definition-ti_null_handle) if the runtime fails
@@ -1022,17 +1076,21 @@ TI_DLL_EXPORT void TI_API_CALL ti_wait(TiRuntime runtime);
 TI_DLL_EXPORT TiAotModule TI_API_CALL
 ti_load_aot_module(TiRuntime runtime, const char *module_path);
 
-// Function `ti_create_aot_module`
+// Function `ti_create_aot_module` (1.4.0)
+//
+// Creates a pre-compiled AOT module from TCM data.
+// Returns [`TI_NULL_HANDLE`](#definition-ti_null_handle) if the runtime fails
+// to create the AOT module from TCM data.
 TI_DLL_EXPORT TiAotModule TI_API_CALL ti_create_aot_module(TiRuntime runtime,
                                                            const void *tcm,
                                                            uint64_t size);
 
-// Function `ti_destroy_aot_module`
+// Function `ti_destroy_aot_module` (1.4.0)
 //
 // Destroys a loaded AOT module and releases all related resources.
 TI_DLL_EXPORT void TI_API_CALL ti_destroy_aot_module(TiAotModule aot_module);
 
-// Function `ti_get_aot_module_kernel`
+// Function `ti_get_aot_module_kernel` (1.4.0)
 //
 // Retrieves a pre-compiled Taichi kernel from the AOT module.
 // Returns [`TI_NULL_HANDLE`](#definition-ti_null_handle) if the module does not
@@ -1040,7 +1098,7 @@ TI_DLL_EXPORT void TI_API_CALL ti_destroy_aot_module(TiAotModule aot_module);
 TI_DLL_EXPORT TiKernel TI_API_CALL
 ti_get_aot_module_kernel(TiAotModule aot_module, const char *name);
 
-// Function `ti_get_aot_module_compute_graph`
+// Function `ti_get_aot_module_compute_graph` (1.4.0)
 //
 // Retrieves a pre-compiled compute graph from the AOT module.
 // Returns [`TI_NULL_HANDLE`](#definition-ti_null_handle) if the module does not

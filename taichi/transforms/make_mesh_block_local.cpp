@@ -465,7 +465,7 @@ MakeMeshBlockLocal::MakeMeshBlockLocal(OffloadedStmt *offload,
         break;  // not enough space to ensure occupacy
       }
       TI_TRACE("available = {}, x = {}, loop_index = {}, unique_access = {}",
-               available_bytes, cache.total_flags, int(cache.loop_index),
+               available_bytes, int(cache.total_flags), int(cache.loop_index),
                cache.unique_accessed);
       caches->caches.insert(std::make_pair(cache.snode, cache));
     }
@@ -500,11 +500,11 @@ MakeMeshBlockLocal::MakeMeshBlockLocal(OffloadedStmt *offload,
   bls_offset_in_bytes_ = offload->bls_size;
   if (offload->bls_prologue == nullptr) {
     offload->bls_prologue = std::make_unique<Block>();
-    offload->bls_prologue->parent_stmt = offload;
+    offload->bls_prologue->set_parent_stmt(offload);
   }
   if (offload->bls_epilogue == nullptr) {
     offload->bls_epilogue = std::make_unique<Block>();
-    offload->bls_epilogue->parent_stmt = offload;
+    offload->bls_epilogue->set_parent_stmt(offload);
   }
 
   // Cache both mappings and mesh attribute

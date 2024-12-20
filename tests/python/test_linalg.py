@@ -185,7 +185,7 @@ def _test_polar_decomp(dim, dt):
 
 
 @pytest.mark.parametrize("dim", [2, 3])
-@test_utils.test(default_fp=ti.f32, exclude=ti.opengl)
+@test_utils.test(default_fp=ti.f32, exclude=[ti.opengl, ti.gles])
 def test_polar_decomp_f32(dim):
     _test_polar_decomp(dim, ti.f32)
 
@@ -251,7 +251,7 @@ def test_matrix_factories():
     @ti.kernel
     def fill():
         b[0] = ti.Matrix.identity(ti.f32, 2)
-        b[1] = ti.Matrix.rotation2d(math.pi / 3)
+        b[1] = ti.math.rotation2d(math.pi / 3)
         c[0] = ti.Matrix.zero(ti.f32, 2, 3)
         c[1] = ti.Matrix.one(ti.f32, 2, 3)
         for i in ti.static(range(3)):
@@ -265,8 +265,7 @@ def test_matrix_factories():
 
     sqrt3o2 = math.sqrt(3) / 2
     assert b[0].to_numpy() == test_utils.approx(np.eye(2))
-    assert b[1].to_numpy() == test_utils.approx(
-        np.array([[0.5, -sqrt3o2], [sqrt3o2, 0.5]]))
+    assert b[1].to_numpy() == test_utils.approx(np.array([[0.5, -sqrt3o2], [sqrt3o2, 0.5]]))
     assert c[0].to_numpy() == test_utils.approx(np.zeros((2, 3)))
     assert c[1].to_numpy() == test_utils.approx(np.ones((2, 3)))
 
@@ -286,10 +285,8 @@ def test_init_matrix_from_vectors():
             c = ti.Vector([3.0, 6.0, 9.0])
             m1[i] = ti.Matrix.rows([a, b, c])
             m2[i] = ti.Matrix.cols([a, b, c])
-            m3[i] = ti.Matrix.rows([[1.0, 4.0, 7.0], [2.0, 5.0, 8.0],
-                                    [3.0, 6.0, 9.0]])
-            m4[i] = ti.Matrix.cols([[1.0, 4.0, 7.0], [2.0, 5.0, 8.0],
-                                    [3.0, 6.0, 9.0]])
+            m3[i] = ti.Matrix.rows([[1.0, 4.0, 7.0], [2.0, 5.0, 8.0], [3.0, 6.0, 9.0]])
+            m4[i] = ti.Matrix.cols([[1.0, 4.0, 7.0], [2.0, 5.0, 8.0], [3.0, 6.0, 9.0]])
 
     fill()
 
@@ -357,7 +354,6 @@ def test_min_max():
 # must not throw any error:
 @test_utils.test()
 def test_matrix_list_assign():
-
     m = ti.Matrix.field(2, 2, dtype=ti.i32, shape=(2, 2, 1))
     v = ti.Vector.field(2, dtype=ti.i32, shape=(2, 2, 1))
 

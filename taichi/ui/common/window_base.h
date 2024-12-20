@@ -16,6 +16,8 @@
 #include "taichi/ui/common/app_config.h"
 #include "taichi/program/ndarray.h"
 
+struct GLFWwindow;
+
 namespace taichi::ui {
 
 class WindowBase {
@@ -37,6 +39,8 @@ class WindowBase {
   void set_current_event(const Event &event);
 
   virtual CanvasBase *get_canvas();
+
+  virtual SceneBase *get_scene();
 
   virtual void show();
 

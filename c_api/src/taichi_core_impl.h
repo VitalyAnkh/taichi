@@ -112,16 +112,19 @@ struct Error {
   }
 };
 
+namespace capi {
+class MetalRuntime;
+}  // namespace capi
+
 class Runtime {
  protected:
   // 32 is a magic number in `taichi/inc/constants.h`.
   std::array<uint64_t, 32> host_result_buffer_;
 
-  Runtime(taichi::Arch arch);
+  explicit Runtime(taichi::Arch arch);
 
  public:
   const taichi::Arch arch;
-  taichi::lang::RuntimeContext runtime_context_;
 
   virtual ~Runtime();
 
@@ -135,6 +138,7 @@ class Runtime {
     err.set_last_error();
     return aot_module;
   }
+
   virtual Error create_aot_module(const taichi::io::VirtualDir *dir,
                                   TiAotModule &out) {
     TI_NOT_IMPLEMENTED
@@ -169,19 +173,11 @@ class Runtime {
                                 taichi::lang::ImageLayout layout) {
     TI_NOT_IMPLEMENTED
   }
-  virtual void signal_event(taichi::lang::DeviceEvent *event) {
-    TI_NOT_IMPLEMENTED
-  }
-  virtual void reset_event(taichi::lang::DeviceEvent *event) {
-    TI_NOT_IMPLEMENTED
-  }
-  virtual void wait_event(taichi::lang::DeviceEvent *event) {
-    TI_NOT_IMPLEMENTED
-  }
-  virtual void submit() = 0;
+  virtual void flush() = 0;
   virtual void wait() = 0;
 
   class VulkanRuntime *as_vk();
+  class capi::MetalRuntime *as_mtl();
 };
 
 class AotModule {
@@ -198,17 +194,6 @@ class AotModule {
   taichi::lang::aot::Kernel *get_kernel(const std::string &name);
   taichi::lang::aot::CompiledGraph *get_cgraph(const std::string &name);
   taichi::lang::aot::Module &get();
-  Runtime &runtime();
-};
-
-class Event {
-  Runtime *runtime_;
-  std::unique_ptr<taichi::lang::DeviceEvent> event_;
-
- public:
-  Event(Runtime &runtime, std::unique_ptr<taichi::lang::DeviceEvent> event);
-
-  taichi::lang::DeviceEvent &get();
   Runtime &runtime();
 };
 

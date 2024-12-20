@@ -8,7 +8,7 @@ from tests import test_utils
 def test_function_without_return():
     x = ti.field(ti.i32, shape=())
 
-    @ti.experimental.real_func
+    @ti.real_func
     def foo(val: ti.i32):
         x[None] += val
 
@@ -26,7 +26,7 @@ def test_function_without_return():
 def test_function_with_return():
     x = ti.field(ti.i32, shape=())
 
-    @ti.experimental.real_func
+    @ti.real_func
     def foo(val: ti.i32) -> ti.i32:
         x[None] += val
         return val
@@ -46,7 +46,7 @@ def test_function_with_return():
 def test_call_expressions():
     x = ti.field(ti.i32, shape=())
 
-    @ti.experimental.real_func
+    @ti.real_func
     def foo(val: ti.i32) -> ti.i32:
         if x[None] > 10:
             x[None] += 1
@@ -150,18 +150,20 @@ def test_experimental_templates():
         assert x[None] == 11
         assert y[None] == 21
 
-    @ti.experimental.real_func
+    @ti.real_func
     def inc(x: ti.template()):
         x[None] += 1
 
     @ti.kernel
-    def run_func():
+    def run_func(a: ti.u1):
         x[None] = 10
         y[None] = 20
-        inc(x)
+        if a:
+            inc(x)
         answer[0] = x[None]
         answer[1] = y[None]
-        inc(y)
+        if a:
+            inc(y)
         answer[2] = x[None]
         answer[3] = y[None]
 
@@ -172,25 +174,24 @@ def test_experimental_templates():
         assert answer[3] == 21
 
     run_kernel()
-    run_func()
+    run_func(True)
     verify()
 
 
 @test_utils.test(arch=[ti.cpu, ti.cuda])
 def test_missing_arg_annotation():
-    with pytest.raises(ti.TaichiSyntaxError, match='must be type annotated'):
+    with pytest.raises(ti.TaichiSyntaxError, match="must be type annotated"):
 
-        @ti.experimental.real_func
+        @ti.real_func
         def add(a, b: ti.i32) -> ti.i32:
             return a + b
 
 
 @test_utils.test(arch=[ti.cpu, ti.cuda])
 def test_missing_return_annotation():
-    with pytest.raises(ti.TaichiCompilationError,
-                       match='return value must be annotated'):
+    with pytest.raises(ti.TaichiCompilationError, match="return value must be annotated"):
 
-        @ti.experimental.real_func
+        @ti.real_func
         def add(a: ti.i32, b: ti.i32):
             return a + b
 
@@ -203,7 +204,7 @@ def test_missing_return_annotation():
 
 @test_utils.test(arch=[ti.cpu, ti.cuda])
 def test_different_argument_type():
-    @ti.experimental.real_func
+    @ti.real_func
     def add(a: ti.f32, b: ti.f32) -> ti.f32:
         return a + b
 
@@ -215,9 +216,9 @@ def test_different_argument_type():
 
 
 @pytest.mark.run_in_serial
-@test_utils.test(arch=[ti.cpu, ti.cuda])
+@test_utils.test(arch=[ti.cpu, ti.cuda], cuda_stack_limit=8192)
 def test_recursion():
-    @ti.experimental.real_func
+    @ti.real_func
     def sum(f: ti.template(), l: ti.i32, r: ti.i32) -> ti.i32:
         if l == r:
             return f[l]
@@ -238,9 +239,9 @@ def test_recursion():
 @pytest.mark.run_in_serial
 @test_utils.test(arch=[ti.cpu, ti.cuda], cuda_stack_limit=32768)
 def test_deep_recursion():
-    @ti.experimental.real_func
+    @ti.real_func
     def sum_func(n: ti.i32) -> ti.i32:
-        if (n == 0):
+        if n == 0:
             return 0
         return sum_func(n - 1) + n
 
@@ -255,7 +256,7 @@ def test_deep_recursion():
 def test_multiple_return():
     x = ti.field(ti.i32, shape=())
 
-    @ti.experimental.real_func
+    @ti.real_func
     def foo(val: ti.i32) -> ti.i32:
         if x[None] > 10:
             if x[None] > 20:
@@ -277,7 +278,7 @@ def test_multiple_return():
 
 @test_utils.test(arch=[ti.cpu, ti.cuda])
 def test_return_in_for():
-    @ti.experimental.real_func
+    @ti.real_func
     def foo() -> ti.i32:
         for i in range(10):
             return 42
@@ -291,7 +292,7 @@ def test_return_in_for():
 
 @test_utils.test(arch=[ti.cpu, ti.cuda])
 def test_return_in_while():
-    @ti.experimental.real_func
+    @ti.real_func
     def foo() -> ti.i32:
         i = 1
         while i:
@@ -306,7 +307,7 @@ def test_return_in_while():
 
 @test_utils.test(arch=[ti.cpu, ti.cuda])
 def test_return_in_if_in_for():
-    @ti.experimental.real_func
+    @ti.real_func
     def foo(a: ti.i32) -> ti.i32:
         s = 0
         for i in range(100):
@@ -325,13 +326,13 @@ def test_return_in_if_in_for():
 
 @test_utils.test(arch=[ti.cpu, ti.cuda], debug=True)
 def test_ref():
-    @ti.experimental.real_func
+    @ti.real_func
     def foo(a: ti.ref(ti.f32)):
         a = 7
 
     @ti.kernel
     def bar():
-        a = 5.
+        a = 5.0
         foo(a)
         assert a == 7
 
@@ -345,18 +346,18 @@ def test_ref_atomic():
     cur_arch = ti.lang.impl.get_runtime().prog.config().arch
     if cur_arch == ti.cuda and ti.lang.impl.get_cuda_compute_capability() < 70:
         pytest.skip(
-            'Skip this test on Pascal (and potentially older) architecture, ask turbo0628/Proton for more information'
+            "Skip this test on Pascal (and potentially older) architecture, ask turbo0628/Proton for more information"
         )
 
-    @ti.experimental.real_func
+    @ti.real_func
     def foo(a: ti.ref(ti.f32)):
         a += a
 
     @ti.kernel
     def bar():
-        a = 5.
+        a = 5.0
         foo(a)
-        assert a == 10.
+        assert a == 10.0
 
     bar()
 
@@ -385,11 +386,9 @@ def test_func_ndarray_arg():
     arr[0] = [20, 20, 20]
     test_k(arr)
 
-    assert (arr[0] == [20, 20, 20])
+    assert arr[0] == [20, 20, 20]
 
-    with pytest.raises(
-            ti.TaichiCompilationError,
-            match=r"Expect TensorType element for Ndarray with element_dim"):
+    with pytest.raises(ti.TaichiCompilationError, match=r"Invalid value for argument a"):
         test_error(arr)
 
 
@@ -425,15 +424,31 @@ def test_func_matrix_arg_with_error():
         x = ti.Matrix([3, 4])
         test(x)
 
-    with pytest.raises(
-            ti.TaichiSyntaxError,
-            match=r"is expected to be a Matrix with n 3, but got 2"):
+    with pytest.raises(ti.TaichiSyntaxError, match=r"is expected to be a Matrix with n 3, but got 2"):
         test_error()
+
+
+@test_utils.test(debug=True)
+def test_func_struct_arg():
+    @ti.dataclass
+    class C:
+        i: int
+
+    @ti.func
+    def f(c: C):
+        return c.i
+
+    @ti.kernel
+    def k():
+        c = C(i=2)
+        assert f(c) == 2
+
+    k()
 
 
 @test_utils.test(arch=[ti.cpu, ti.cuda])
 def test_real_func_matrix_arg():
-    @ti.experimental.real_func
+    @ti.real_func
     def mat_arg(a: ti.math.mat2, b: ti.math.vec2) -> float:
         return a[0, 0] + a[0, 1] + a[1, 0] + a[1, 1] + b[0] + b[1]
 
@@ -450,10 +465,23 @@ def test_real_func_matrix_arg():
 
 
 @test_utils.test(arch=[ti.cpu, ti.cuda])
+def test_real_func_matrix_return():
+    @ti.real_func
+    def mat_ret() -> ti.math.mat2:
+        return ti.math.mat2(1, 2, 3, 4)
+
+    @ti.kernel
+    def foo() -> ti.math.mat2:
+        return mat_ret()
+
+    assert (foo() == ti.math.mat2(1, 2, 3, 4)).all()
+
+
+@test_utils.test(arch=[ti.cpu, ti.cuda])
 def test_real_func_struct_ret():
     s = ti.types.struct(a=ti.i16, b=ti.f64)
 
-    @ti.experimental.real_func
+    @ti.real_func
     def bar() -> s:
         return s(a=123, b=ti.f64(1.2345e300))
 
@@ -470,7 +498,7 @@ def test_real_func_struct_ret_with_matrix():
     s0 = ti.types.struct(a=ti.math.vec3, b=ti.i16)
     s1 = ti.types.struct(a=ti.f32, b=s0)
 
-    @ti.experimental.real_func
+    @ti.real_func
     def bar() -> s1:
         return s1(a=1, b=s0(a=ti.Vector([100, 0.2, 3], dt=ti.f32), b=65537))
 
@@ -480,3 +508,39 @@ def test_real_func_struct_ret_with_matrix():
         return s.a + s.b.a[0] + s.b.a[1] + s.b.a[2] + s.b.b
 
     assert foo() == pytest.approx(105.2)
+
+
+@test_utils.test(arch=[ti.cpu, ti.cuda])
+def test_break_in_real_func():
+    @ti.real_func
+    def bar() -> int:
+        a = 0
+        for i in range(10):
+            if i == 5:
+                break
+            a += 1
+        return a
+
+    @ti.kernel
+    def foo() -> int:
+        return bar()
+
+    assert foo() == 5
+
+
+@test_utils.test(arch=[ti.cpu, ti.cuda])
+def test_continue_in_real_func():
+    @ti.real_func
+    def bar() -> int:
+        a = 0
+        for i in range(10):
+            if i % 2 == 0:
+                continue
+            a += 1
+        return a
+
+    @ti.kernel
+    def foo() -> int:
+        return bar()
+
+    assert foo() == 5

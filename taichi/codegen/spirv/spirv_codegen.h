@@ -14,13 +14,12 @@ class Kernel;
 
 namespace spirv {
 
-void lower(Kernel *kernel);
-
 class KernelCodegen {
  public:
   struct Params {
     std::string ti_kernel_name;
-    Kernel *kernel;
+    const Kernel *kernel{nullptr};
+    const IRNode *ir_root{nullptr};
     std::vector<CompiledSNodeStructs> compiled_structs;
     Arch arch;
     DeviceCapabilityConfig caps;

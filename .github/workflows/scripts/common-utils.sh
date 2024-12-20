@@ -2,52 +2,61 @@
 
 set -x
 
-setup_python() {
-    for conda in miniconda miniconda3 miniforge3; do
-        if [[ -d $HOME/$conda ]]; then
-            source $HOME/$conda/bin/activate
-            conda activate "$PY"
-            break
-        fi
-    done
-    python3 -m pip install -U pip
-    python3 -m pip uninstall taichi taichi-nightly -y
+function unset-git-caching-proxy {
+    echo "Unsetting git caching proxy"
+    git config --global --list | grep 'url\.' | cut -d'=' -f1 | xargs -L1 git config --global --unset-all || true
 }
 
-function setup-sccache-local {
-    if [ -z $SCCACHE_ROOT ]; then
-        echo "Skipping sccache setup since SCCACHE_ROOT is not set"
-        return
+function set-git-caching-proxy {
+    trap unset-git-caching-proxy EXIT
+    echo "Setting git caching proxy"
+    git config --global --add url.http://oauth2:$GITHUB_TOKEN@git-cdn-github.botmaster.tgr/.insteadOf https://github.com/
+    git config --global --add url.http://oauth2:$GITHUB_TOKEN@git-cdn-github.botmaster.tgr/.insteadOf git@github.com:
+}
+
+if [ ! -z "$TI_USE_GIT_CACHE" ]; then
+    set-git-caching-proxy
+fi
+
+
+install_taichi_wheel() {
+    if [ ! -z "$AMDGPU_TEST" ]; then
+        sudo chmod 666 /dev/kfd
+        sudo chmod 666 /dev/dri/*
     fi
 
-    mkdir -p $SCCACHE_ROOT/{bin,cache}
+    if [ "$(uname -s):$(uname -m)" == "Darwin:arm64" ]; then
+        # No FORTRAN compiler is currently working reliably on M1 Macs
+        # We can't just pip install scipy, using conda instead
+        conda install -n $PY -y scipy
+    fi
 
-    export SCCACHE_DIR=$SCCACHE_ROOT/cache
-    export SCCACHE_CACHE_SIZE="10G"
-    export SCCACHE_LOG=error
-    export SCCACHE_ERROR_LOG=$SCCACHE_ROOT/sccache_error.log
-
-    echo "SCCACHE_ROOT: $SCCACHE_ROOT"
-
-    if [ ! -x $SCCACHE_ROOT/bin/sccache ]; then
+    python3 -m pip uninstall -y taichi taichi-nightly || true
+    python3 -m pip install dist/*.whl
+    if [ -z "$GPU_TEST" ]; then
+        python3 -m pip install -r requirements_test.txt
+        python3 -m pip install "torch>1.12.0; python_version < '3.10'"
+        # Paddle's develop package doesn't support CI's MACOS machine at present
         if [[ $OSTYPE == "linux-"* ]]; then
-            wget https://github.com/mozilla/sccache/releases/download/v0.2.15/sccache-v0.2.15-x86_64-unknown-linux-musl.tar.gz
-            tar -xzf sccache-v0.2.15-x86_64-unknown-linux-musl.tar.gz
-            mv sccache-v0.2.15-x86_64-unknown-linux-musl/* $SCCACHE_ROOT/bin
-        elif [[ $(uname -m) == "arm64" ]]; then
-            wget https://github.com/mozilla/sccache/releases/download/v0.2.15/sccache-v0.2.15-aarch64-apple-darwin.tar.gz
-            tar -xzf sccache-v0.2.15-aarch64-apple-darwin.tar.gz
-            mv sccache-v0.2.15-aarch64-apple-darwin/* $SCCACHE_ROOT/bin
-        else
-            wget https://github.com/mozilla/sccache/releases/download/v0.2.15/sccache-v0.2.15-x86_64-apple-darwin.tar.gz
-            tar -xzf sccache-v0.2.15-x86_64-apple-darwin.tar.gz
-            mv sccache-v0.2.15-x86_64-apple-darwin/* $SCCACHE_ROOT/bin
+            python3 -m pip install "paddlepaddle==2.3.0; python_version < '3.10'"
         fi
-        chmod +x $SCCACHE_ROOT/bin/sccache
-    fi
+    else
+        ## Only GPU machine uses system python.
+        export PATH=$PATH:$HOME/.local/bin
+        # pip will skip packages if already installed
+        python3 -m pip install -r requirements_test.txt
+        # Import Paddle's develop GPU package will occur error `Illegal Instruction`.
 
-    export PATH=$SCCACHE_ROOT/bin:$PATH
-    export TAICHI_CMAKE_ARGS="$TAICHI_CMAKE_ARGS -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+        # Log hardware info for the current CI-bot
+        # There's random CI failure caused by "import paddle" (Linux)
+        # Top suspect is an issue with MKL support for specific CPU
+        echo "CI-bot CPU info:"
+        if [[ $OSTYPE == "linux-"* ]]; then
+            lscpu | grep "Model name"
+        elif [[ $OSTYPE == "darwin"* ]]; then
+            sysctl -a | grep machdep.cpu
+        fi
+    fi
 }
 
 function clear-taichi-offline-cache {
@@ -117,6 +126,7 @@ function ci-docker-run {
         -e PY \
         -e PROJECT_NAME \
         -e LLVM_VERSION \
+        -e EXTRA_TEST_MARKERS \
         -e TAICHI_CMAKE_ARGS \
         -e IN_DOCKER=true \
         -e TI_CI=1 \
@@ -124,6 +134,7 @@ function ci-docker-run {
         -e SCCACHE_ROOT=/var/lib/sccache \
         -e CACHE_HOME=/var/lib/cache-home \
         -e GIT_ALTERNATE_OBJECT_DIRECTORIES=/var/lib/git-cache/objects \
+        -e GITHUB_TOKEN \
         -v $(readlink -f $CACHE_HOME):/var/lib/cache-home \
         -v $(readlink -f $CACHE_HOME/sccache):/var/lib/sccache \
         -v $(readlink -f $CACHE_HOME/git-cache):/var/lib/git-cache \
@@ -170,6 +181,7 @@ function ci-docker-run-amdgpu {
     ci-docker-run \
         --device=/dev/kfd \
         --device=/dev/dri \
+        --device=/dev/vga_arbiter \
         --group-add=video \
         -e DISPLAY=:$i \
         -e GPU_TEST=ON \
@@ -197,6 +209,7 @@ function grab-android-bot {
             export BOT_LOCK_KEY="android-bot-lock:$bot"
             LOCKED=$(redis-cli -h $REDIS_HOST --raw setnx $BOT_LOCK_KEY $BOT_LOCK_COOKIE)
             if [ $LOCKED -eq 1 ]; then
+                trap release-android-bot EXIT
                 redis-cli -h $REDIS_HOST --raw expire android-bot-lock:$bot 300 > /dev/null
                 break
             fi
@@ -230,10 +243,10 @@ function run-android-app {
     /android-sdk/platform-tools/adb logcat -c
     /android-sdk/platform-tools/adb shell am start $ACTIVITY
     sleep $WAIT_TIME
-    /android-sdk/platform-tools/adb logcat -d -v time 'CRASH:E *:F' | tee logcat.log
+    /android-sdk/platform-tools/adb logcat -d -v time 'CRASH:E *:F' | grep -v -- '----- beginning of ' | tee logcat.log
+
     /android-sdk/platform-tools/adb shell am force-stop $(echo $ACTIVITY | sed 's#/.*$##g')
     /android-sdk/platform-tools/adb disconnect
-    release-android-bot
     if [ -s logcat.log ]; then
         echo "!!!!!!!!!!!!!! Something is wrong !!!!!!!!!!!!!!"
         exit 1

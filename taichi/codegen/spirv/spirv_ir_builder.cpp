@@ -1,5 +1,6 @@
 #include "taichi/codegen/spirv/spirv_ir_builder.h"
 #include "taichi/rhi/dx/dx_device.h"
+#include "fp16.h"
 
 namespace taichi::lang {
 
@@ -247,18 +248,21 @@ PhiValue IRBuilder::make_phi(const SType &out_type, uint32_t num_incoming) {
 Value IRBuilder::int_immediate_number(const SType &dtype,
                                       int64_t value,
                                       bool cache) {
+  TI_ASSERT(is_integral(dtype.dt));
   return get_const(dtype, reinterpret_cast<uint64_t *>(&value), cache);
 }
 
 Value IRBuilder::uint_immediate_number(const SType &dtype,
                                        uint64_t value,
                                        bool cache) {
+  TI_ASSERT(is_integral(dtype.dt));
   return get_const(dtype, &value, cache);
 }
 
 Value IRBuilder::float_immediate_number(const SType &dtype,
                                         double value,
                                         bool cache) {
+  TI_ASSERT(is_real(dtype.dt));
   if (data_type_bits(dtype.dt) == 64) {
     return get_const(dtype, reinterpret_cast<uint64_t *>(&value), cache);
   } else if (data_type_bits(dtype.dt) == 32) {
@@ -268,8 +272,7 @@ Value IRBuilder::float_immediate_number(const SType &dtype,
     return get_const(dtype, &data, cache);
   } else if (data_type_bits(dtype.dt) == 16) {
     float fvalue = static_cast<float>(value);
-    uint16_t *ptr = reinterpret_cast<uint16_t *>(&fvalue);
-    uint64_t data = ptr[0];
+    uint64_t data = fp16_ieee_from_fp32_value(fvalue);
     return get_const(dtype, &data, cache);
   } else {
     TI_ERROR("Type {} not supported.", dtype.dt->to_string());
@@ -328,7 +331,31 @@ SType IRBuilder::get_primitive_type(const DataType &dt) const {
   }
 }
 
+SType IRBuilder::from_taichi_type(const DataType &dt, bool has_buffer_ptr) {
+  if (dt->is<PrimitiveType>()) {
+    return get_primitive_type(dt);
+  } else if (dt->is<PointerType>()) {
+    if (has_buffer_ptr) {
+      return t_uint64_;
+    } else {
+      return t_uint32_;
+    }
+  } else if (auto struct_type = dt->cast<lang::StructType>()) {
+    std::vector<std::tuple<SType, std::string, size_t>> components;
+    for (const auto &[type, name, offset] : struct_type->elements()) {
+      components.push_back(std::make_tuple(
+          from_taichi_type(type, has_buffer_ptr), name, offset));
+    }
+    return create_struct_type(components);
+  } else {
+    TI_ERROR("Type {} not supported.", dt->to_string());
+  }
+}
+
 size_t IRBuilder::get_primitive_type_size(const DataType &dt) const {
+  if (!dt->is<PrimitiveType>()) {
+    TI_ERROR("Type {} not supported.", dt->to_string());
+  }
   if (dt == PrimitiveType::i64 || dt == PrimitiveType::u64 ||
       dt == PrimitiveType::f64) {
     return 8;
@@ -353,6 +380,8 @@ SType IRBuilder::get_primitive_uint_type(const DataType &dt) const {
   } else if (dt == PrimitiveType::i16 || dt == PrimitiveType::u16 ||
              dt == PrimitiveType::f16) {
     return t_uint16_;
+  } else if (dt == PrimitiveType::u1) {
+    return t_bool_;
   } else {
     return t_uint8_;
   }
@@ -368,6 +397,8 @@ DataType IRBuilder::get_taichi_uint_type(const DataType &dt) const {
   } else if (dt == PrimitiveType::i16 || dt == PrimitiveType::u16 ||
              dt == PrimitiveType::f16) {
     return PrimitiveType::u16;
+  } else if (dt == PrimitiveType::u1) {
+    return PrimitiveType::u1;
   } else {
     return PrimitiveType::u8;
   }
@@ -392,13 +423,15 @@ SType IRBuilder::get_pointer_type(const SType &value_type,
   return t;
 }
 
-SType IRBuilder::get_sampled_image_type(const SType &primitive_type,
-                                        int num_dimensions) {
+SType IRBuilder::get_underlying_image_type(const SType &primitive_type,
+                                           int num_dimensions) {
   auto key = std::make_pair(primitive_type.id, num_dimensions);
-  auto it = sampled_image_ptr_tbl_.find(key);
-  if (it != sampled_image_ptr_tbl_.end()) {
+
+  auto it = sampled_image_underlying_image_type_.find(key);
+  if (it != sampled_image_underlying_image_type_.end()) {
     return it->second;
   }
+
   int img_id = id_counter_++;
   spv::Dim dim;
   if (num_dimensions == 1) {
@@ -415,6 +448,26 @@ SType IRBuilder::get_sampled_image_type(const SType &primitive_type,
                /*Depth=*/0, /*Arrayed=*/0, /*MS=*/0, /*Sampled=*/1,
                spv::ImageFormatUnknown)
       .commit(&global_);
+
+  SType image_type;
+  image_type.id = img_id;
+  image_type.flag = TypeKind::kImage;
+  sampled_image_underlying_image_type_[key] = image_type;
+
+  return image_type;
+}
+
+SType IRBuilder::get_sampled_image_type(const SType &primitive_type,
+                                        int num_dimensions) {
+  auto key = std::make_pair(primitive_type.id, num_dimensions);
+  auto it = sampled_image_ptr_tbl_.find(key);
+  if (it != sampled_image_ptr_tbl_.end()) {
+    return it->second;
+  }
+
+  SType image_type = get_underlying_image_type(primitive_type, num_dimensions);
+  int img_id = image_type.id;
+
   SType sampled_t;
   sampled_t.id = id_counter_++;
   sampled_t.flag = TypeKind::kImage;
@@ -422,6 +475,7 @@ SType IRBuilder::get_sampled_image_type(const SType &primitive_type,
       .add_seq(sampled_t, img_id)
       .commit(&global_);
   sampled_image_ptr_tbl_[key] = sampled_t;
+
   return sampled_t;
 }
 
@@ -508,15 +562,18 @@ SType IRBuilder::get_storage_pointer_type(const SType &value_type) {
   return get_pointer_type(value_type, storage_class);
 }
 
-SType IRBuilder::get_array_type(const SType &value_type, uint32_t num_elems) {
+SType IRBuilder::get_array_type(const SType &_value_type, uint32_t num_elems) {
+  auto value_type = _value_type;
+  if (value_type.dt->is_primitive(PrimitiveTypeID::u1)) {
+    value_type = i32_type();
+  }
   SType arr_type;
   arr_type.id = id_counter_++;
   arr_type.flag = TypeKind::kPtr;
   arr_type.element_type_id = value_type.id;
 
   if (num_elems != 0) {
-    Value length = uint_immediate_number(
-        get_primitive_type(get_data_type<uint32>()), num_elems);
+    Value length = uint_immediate_number(t_uint32_, num_elems);
     ib_.begin(spv::OpTypeArray)
         .add_seq(arr_type, value_type, length)
         .commit(&global_);
@@ -806,8 +863,14 @@ Value IRBuilder::sample_texture(Value texture_var,
 Value IRBuilder::fetch_texel(Value texture_var,
                              const std::vector<Value> &args,
                              Value lod) {
-  auto image = this->load_variable(
+  auto sampled_image = this->load_variable(
       texture_var, this->get_sampled_image_type(f32_type(), args.size()));
+
+  // OpImageFetch requires operand with OpImageType
+  // We have to extract the underlying OpImage from OpSampledImage here
+  SType image_type = get_underlying_image_type(f32_type(), args.size());
+  Value image_val = make_value(spv::OpImage, image_type, sampled_image);
+
   Value uv;
   if (args.size() == 1) {
     uv = args[0];
@@ -820,8 +883,8 @@ Value IRBuilder::fetch_texel(Value texture_var,
     TI_ERROR("Unsupported number of texture coordinates");
   }
   uint32_t lod_operand = 0x2;
-  auto res_vec4 =
-      make_value(spv::OpImageFetch, t_v4_fp32_, image, uv, lod_operand, lod);
+  auto res_vec4 = make_value(spv::OpImageFetch, t_v4_fp32_, image_val, uv,
+                             lod_operand, lod);
   return res_vec4;
 }
 
@@ -967,6 +1030,11 @@ Value IRBuilder::get_subgroup_size() {
   return this->make_value(spv::OpLoad, t_uint32_, subgroup_size_);
 }
 
+Value IRBuilder::popcnt(Value x) {
+  TI_ASSERT(is_integral(x.stype.dt));
+  return make_value(spv::OpBitCount, x.stype, x);
+}
+
 #define DEFINE_BUILDER_BINARY_USIGN_OP(_OpName, _Op)   \
   Value IRBuilder::_OpName(Value a, Value b) {         \
     TI_ASSERT(a.stype.id == b.stype.id);               \
@@ -1032,10 +1100,10 @@ DEFINE_BUILDER_CMP_OP(ge, GreaterThanEqual);
   Value IRBuilder::_OpName(Value a, Value b) {                             \
     TI_ASSERT(a.stype.id == b.stype.id);                                   \
     const auto &bool_type = t_bool_; /* TODO: Only scalar supported now */ \
-    if (is_integral(a.stype.dt)) {                                         \
-      return make_value(spv::OpI##_Op, bool_type, a, b);                   \
-    } else if (a.stype.id == bool_type.id) {                               \
+    if (a.stype.id == bool_type.id) {                                      \
       return make_value(spv::OpLogical##_Op, bool_type, a, b);             \
+    } else if (is_integral(a.stype.dt)) {                                  \
+      return make_value(spv::OpI##_Op, bool_type, a, b);                   \
     } else {                                                               \
       TI_ASSERT(is_real(a.stype.dt));                                      \
       return make_value(spv::OpFOrd##_Op, bool_type, a, b);                \
@@ -1044,6 +1112,27 @@ DEFINE_BUILDER_CMP_OP(ge, GreaterThanEqual);
 
 DEFINE_BUILDER_CMP_UOP(eq, Equal);
 DEFINE_BUILDER_CMP_UOP(ne, NotEqual);
+
+#define DEFINE_BUILDER_LOGICAL_OP(_OpName, _Op)                               \
+  Value IRBuilder::_OpName(Value a, Value b) {                                \
+    TI_ASSERT(a.stype.id == b.stype.id);                                      \
+    if (a.stype.id == t_bool_.id) {                                           \
+      return make_value(spv::OpLogical##_Op, t_bool_, a, b);                  \
+    } else if (is_integral(a.stype.dt)) {                                     \
+      Value val_a = make_value(spv::OpINotEqual, t_bool_, a,                  \
+                               int_immediate_number(a.stype, 0));             \
+      Value val_b = make_value(spv::OpINotEqual, t_bool_, b,                  \
+                               int_immediate_number(b.stype, 0));             \
+      Value val_ret = make_value(spv::OpLogical##_Op, t_bool_, val_a, val_b); \
+      return cast(a.stype, val_ret);                                          \
+    } else {                                                                  \
+      TI_ERROR("Logical ops on real types are not supported.");               \
+      return Value();                                                         \
+    }                                                                         \
+  }
+
+DEFINE_BUILDER_LOGICAL_OP(logical_and, And);
+DEFINE_BUILDER_LOGICAL_OP(logical_or, Or);
 
 Value IRBuilder::bit_field_extract(Value base, Value offset, Value count) {
   TI_ASSERT(is_integral(base.stype.dt));
@@ -1233,84 +1322,117 @@ bool IRBuilder::check_value_existence(const std::string &name) const {
 
 Value IRBuilder::float_atomic(AtomicOpType op_type,
                               Value addr_ptr,
-                              Value data) {
-  auto atomic_func_ = [&](std::function<Value(Value, Value)> atomic_op) {
-    Value ret_val_int = alloca_variable(t_uint32_);
-
-    // do-while
-    Label head = new_label();
-    Label body = new_label();
-    Label branch_true = new_label();
-    Label branch_false = new_label();
-    Label merge = new_label();
-    Label exit = new_label();
-
-    make_inst(spv::OpBranch, head);
-    start_label(head);
-    make_inst(spv::OpLoopMerge, branch_true, merge, 0);
-    make_inst(spv::OpBranch, body);
-    make_inst(spv::OpLabel, body);
-    // while (true)
-    {
-      // int old = addr_ptr[0];
-      Value old_val = load_variable(addr_ptr, t_uint32_);
-      // int new = floatBitsToInt(atomic_op(intBitsToFloat(old), data));
-      Value old_float = make_value(spv::OpBitcast, t_fp32_, old_val);
-      Value new_float = atomic_op(old_float, data);
-      Value new_val = make_value(spv::OpBitcast, t_uint32_, new_float);
-      // int loaded = atomicCompSwap(vals[0], old, new);
-      /*
-      * Don't need this part, theoretically
-      auto semantics = uint_immediate_number(
-          t_uint32_, spv::MemorySemanticsAcquireReleaseMask |
-                         spv::MemorySemanticsUniformMemoryMask);
-      make_inst(spv::OpMemoryBarrier, const_i32_one_, semantics);
-      */
-      Value loaded = make_value(
-          spv::OpAtomicCompareExchange, t_uint32_, addr_ptr,
-          /*scope=*/const_i32_one_, /*semantics if equal=*/const_i32_zero_,
-          /*semantics if unequal=*/const_i32_zero_, new_val, old_val);
-      // bool ok = (loaded == old);
-      Value ok = make_value(spv::OpIEqual, t_bool_, loaded, old_val);
-      // int ret_val_int = loaded;
-      store_variable(ret_val_int, loaded);
-      // if (ok)
-      make_inst(spv::OpSelectionMerge, branch_false, 0);
-      make_inst(spv::OpBranchConditional, ok, branch_true, branch_false);
-      {
-        make_inst(spv::OpLabel, branch_true);
-        make_inst(spv::OpBranch, exit);
-      }
-      // else
-      {
-        make_inst(spv::OpLabel, branch_false);
-        make_inst(spv::OpBranch, merge);
-      }
-      // continue;
-      make_inst(spv::OpLabel, merge);
-      make_inst(spv::OpBranch, head);
-    }
-    start_label(exit);
-
-    return make_value(spv::OpBitcast, t_fp32_,
-                      load_variable(ret_val_int, t_uint32_));
-  };
-
+                              Value data,
+                              const DataType &dt) {
   if (op_type == AtomicOpType::add) {
-    return atomic_func_([&](Value lhs, Value rhs) { return add(lhs, rhs); });
+    return atomic_operation(
+        addr_ptr, data, [&](Value lhs, Value rhs) { return add(lhs, rhs); },
+        dt);
   } else if (op_type == AtomicOpType::sub) {
-    return atomic_func_([&](Value lhs, Value rhs) { return sub(lhs, rhs); });
+    return atomic_operation(
+        addr_ptr, data, [&](Value lhs, Value rhs) { return sub(lhs, rhs); },
+        dt);
+  } else if (op_type == AtomicOpType::mul) {
+    return atomic_operation(
+        addr_ptr, data, [&](Value lhs, Value rhs) { return mul(lhs, rhs); },
+        dt);
   } else if (op_type == AtomicOpType::min) {
-    return atomic_func_([&](Value lhs, Value rhs) {
-      return call_glsl450(t_fp32_, /*FMin*/ 37, lhs, rhs);
-    });
+    return atomic_operation(
+        addr_ptr, data,
+        [&](Value lhs, Value rhs) {
+          return call_glsl450(t_fp32_, /*FMin*/ 37, lhs, rhs);
+        },
+        dt);
   } else if (op_type == AtomicOpType::max) {
-    return atomic_func_([&](Value lhs, Value rhs) {
-      return call_glsl450(t_fp32_, /*FMax*/ 40, lhs, rhs);
-    });
+    return atomic_operation(
+        addr_ptr, data,
+        [&](Value lhs, Value rhs) {
+          return call_glsl450(t_fp32_, /*FMax*/ 40, lhs, rhs);
+        },
+        dt);
   } else {
     TI_NOT_IMPLEMENTED
   }
+}
+
+Value IRBuilder::integer_atomic(AtomicOpType op_type,
+                                Value addr_ptr,
+                                Value data,
+                                const DataType &dt) {
+  if (op_type == AtomicOpType::mul) {
+    return atomic_operation(
+        addr_ptr, data, [&](Value lhs, Value rhs) { return mul(lhs, rhs); },
+        dt);
+  } else {
+    TI_NOT_IMPLEMENTED
+  }
+}
+
+Value IRBuilder::atomic_operation(Value addr_ptr,
+                                  Value data,
+                                  std::function<Value(Value, Value)> op,
+                                  const DataType &dt) {
+  SType out_type = get_primitive_type(dt);
+  SType res_type = get_primitive_uint_type(dt);
+  Value ret_val_int = alloca_variable(res_type);
+
+  // do-while
+  Label head = new_label();
+  Label body = new_label();
+  Label branch_true = new_label();
+  Label branch_false = new_label();
+  Label merge = new_label();
+  Label exit = new_label();
+
+  make_inst(spv::OpBranch, head);
+  start_label(head);
+  make_inst(spv::OpLoopMerge, branch_true, merge, 0);
+  make_inst(spv::OpBranch, body);
+  make_inst(spv::OpLabel, body);
+  // while (true)
+  {
+    // int old = addr_ptr[0];
+    Value old_val = load_variable(addr_ptr, res_type);
+    // int new = dataTypeBitsToInt(atomic_op(intBitsToDataType(old), data));
+    Value old_data_value = make_value(spv::OpBitcast, out_type, old_val);
+    Value new_data_value = op(old_data_value, data);
+    Value new_val = make_value(spv::OpBitcast, res_type, new_data_value);
+    // int loaded = atomicCompSwap(vals[0], old, new);
+    /*
+    * Don't need this part, theoretically
+    auto semantics = uint_imm ediate_number(
+        t_uint32_, spv::MemorySemanticsAcquireReleaseMask |
+                       spv::MemorySemanticsUniformMemoryMask);
+    make_inst(spv::OpMemoryBarrier, const_i32_one_, semantics);
+    */
+    Value loaded = make_value(
+        spv::OpAtomicCompareExchange, res_type, addr_ptr,
+        /*scope=*/const_i32_one_, /*semantics if equal=*/const_i32_zero_,
+        /*semantics if unequal=*/const_i32_zero_, new_val, old_val);
+    // bool ok = (loaded == old);
+    Value ok = make_value(spv::OpIEqual, t_bool_, loaded, old_val);
+    // int ret_val_int = loaded;
+    store_variable(ret_val_int, loaded);
+    // if (ok)
+    make_inst(spv::OpSelectionMerge, branch_false, 0);
+    make_inst(spv::OpBranchConditional, ok, branch_true, branch_false);
+    {
+      make_inst(spv::OpLabel, branch_true);
+      make_inst(spv::OpBranch, exit);
+    }
+    // else
+    {
+      make_inst(spv::OpLabel, branch_false);
+      make_inst(spv::OpBranch, merge);
+    }
+    // continue;
+    make_inst(spv::OpLabel, merge);
+    make_inst(spv::OpBranch, head);
+  }
+  start_label(exit);
+
+  return make_value(spv::OpBitcast, out_type,
+                    load_variable(ret_val_int, res_type));
 }
 
 Value IRBuilder::rand_u32(Value global_tmp_) {
@@ -1374,7 +1496,9 @@ Value IRBuilder::get_const(const SType &dtype,
     }
   }
 
-  TI_ASSERT(dtype.flag == TypeKind::kPrimitive);
+  TI_WARN_IF(dtype.flag != TypeKind::kPrimitive,
+             "Trying to get const with dtype.flag={} , .dt={}", int(dtype.flag),
+             dtype.dt.to_string());
   Value ret = new_value(dtype, ValueKind::kConstant);
   if (dtype.dt->is_primitive(PrimitiveTypeID::u1)) {
     // bool type
@@ -1567,6 +1691,22 @@ void IRBuilder::init_random_function(Value global_tmp_) {
   }
 
   init_rand_ = true;
+}
+
+Value IRBuilder::make_access_chain(const SType &out_type,
+                                   Value base,
+                                   const std::vector<int> &indices) {
+  Value ret = new_value(out_type, ValueKind::kVariablePtr);
+  std::vector<Value> index_values;
+  for (auto &ind : indices) {
+    index_values.push_back(int_immediate_number(t_int32_, ind));
+  }
+  ib_.begin(spv::OpAccessChain).add_seq(out_type, ret, base);
+  for (auto &ind : index_values) {
+    ib_.add(ind);
+  }
+  ib_.commit(&function_);
+  return ret;
 }
 
 }  // namespace spirv

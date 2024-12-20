@@ -2,9 +2,13 @@
 #include "taichi_opengl_impl.h"
 #include "taichi_vulkan_impl.h"
 #include "taichi_llvm_impl.h"
+#include "taichi_metal_impl.h"
 #include "taichi/program/ndarray.h"
 #include "taichi/program/texture.h"
+#include "taichi/program/matrix.h"
+#include "taichi/program/launch_context_builder.h"
 #include "taichi/common/virtual_dir.h"
+#include "taichi/common/utils.h"
 
 bool is_vulkan_available() {
 #ifdef TI_WITH_VULKAN
@@ -48,6 +52,14 @@ bool is_arm64_available() {
 #endif
 }
 
+bool is_metal_available() {
+#if defined(__APPLE__) && defined(TI_WITH_METAL)
+  return taichi::lang::metal::is_metal_api_available();
+#else
+  return false;
+#endif  // __APPLE__
+}
+
 struct ErrorCache {
   TiError error{TI_ERROR_SUCCESS};
   std::string message{};
@@ -81,6 +93,8 @@ const char *describe_error(TiError error) {
       return "invalid state";
     case TI_ERROR_INCOMPATIBLE_MODULE:
       return "incompatible module";
+    case TI_ERROR_OUT_OF_MEMORY:
+      return "out of memory";
     default:
       return "unknown error";
   }
@@ -100,10 +114,22 @@ VulkanRuntime *Runtime::as_vk() {
   return nullptr;
 #endif
 }
+capi::MetalRuntime *Runtime::as_mtl() {
+  TI_ASSERT(arch == taichi::Arch::metal);
+#ifdef TI_WITH_METAL
+  return static_cast<capi::MetalRuntime *>(this);
+#else
+  return nullptr;
+#endif
+}
 
 TiMemory Runtime::allocate_memory(
     const taichi::lang::Device::AllocParams &params) {
-  taichi::lang::DeviceAllocation devalloc = this->get().allocate_memory(params);
+  taichi::lang::DeviceAllocation devalloc;
+  taichi::lang::RhiResult res = this->get().allocate_memory(params, &devalloc);
+  if (res != taichi::lang::RhiResult::success) {
+    throw std::bad_alloc();
+  }
   return devalloc2devmem(*this, devalloc);
 }
 void Runtime::free_memory(TiMemory devmem) {
@@ -136,18 +162,11 @@ Runtime &AotModule::runtime() {
   return *runtime_;
 }
 
-Event::Event(Runtime &runtime, std::unique_ptr<taichi::lang::DeviceEvent> event)
-    : runtime_(&runtime), event_(std::move(event)) {
-}
-
-taichi::lang::DeviceEvent &Event::get() {
-  return *event_;
-}
-Runtime &Event::runtime() {
-  return *runtime_;
-}
-
 // -----------------------------------------------------------------------------
+
+uint32_t ti_get_version() {
+  return TI_C_API_VERSION;
+}
 
 void ti_get_available_archs(uint32_t *arch_count, TiArch *archs) {
   if (arch_count == nullptr) {
@@ -159,8 +178,8 @@ void ti_get_available_archs(uint32_t *arch_count, TiArch *archs) {
     if (is_vulkan_available()) {
       AVAILABLE_ARCHS.emplace_back(TI_ARCH_VULKAN);
     }
-    if (is_opengl_available()) {
-      AVAILABLE_ARCHS.emplace_back(TI_ARCH_OPENGL);
+    if (is_metal_available()) {
+      AVAILABLE_ARCHS.emplace_back(TI_ARCH_METAL);
     }
     if (is_cuda_available()) {
       AVAILABLE_ARCHS.emplace_back(TI_ARCH_CUDA);
@@ -170,6 +189,9 @@ void ti_get_available_archs(uint32_t *arch_count, TiArch *archs) {
     }
     if (is_arm64_available()) {
       AVAILABLE_ARCHS.emplace_back(TI_ARCH_ARM64);
+    }
+    if (is_opengl_available()) {
+      AVAILABLE_ARCHS.emplace_back(TI_ARCH_OPENGL);
     }
   }
 
@@ -182,19 +204,24 @@ void ti_get_available_archs(uint32_t *arch_count, TiArch *archs) {
   }
 }
 
-TiError ti_get_last_error(uint64_t message_size, char *message) {
+TiError ti_get_last_error(uint64_t *message_size, char *message) {
   TiError out = TI_ERROR_INVALID_STATE;
   TI_CAPI_TRY_CATCH_BEGIN();
+  out = thread_error_cache.error;
+
   // Emit message only if the output buffer is property provided.
-  if (message_size > 0 && message != nullptr) {
-    size_t n = thread_error_cache.message.size();
-    if (n >= message_size) {
-      n = message_size - 1;  // -1 for the byte of `\0`.
-    }
+  if (message_size == nullptr) {
+    return out;
+  }
+  size_t buffer_size = *message_size;
+  *message_size = thread_error_cache.message.size() + 1;
+
+  if (buffer_size > 0 && message != nullptr) {
+    // -1 for the byte of `\0`.
+    size_t n = std::min(thread_error_cache.message.size(), buffer_size - 1);
     std::memcpy(message, thread_error_cache.message.data(), n);
     message[n] = '\0';
   }
-  out = thread_error_cache.error;
   TI_CAPI_TRY_CATCH_END();
   return out;
 }
@@ -217,39 +244,61 @@ void ti_set_last_error(TiError error, const char *message) {
   TI_CAPI_TRY_CATCH_END();
 }
 
-TiRuntime ti_create_runtime(TiArch arch) {
+TiRuntime ti_create_runtime(TiArch arch, uint32_t device_index) {
   TiRuntime out = TI_NULL_HANDLE;
   TI_CAPI_TRY_CATCH_BEGIN();
+  // TI_INFO("Taichi Runtime C-API version is: {}", TI_C_API_VERSION);
   switch (arch) {
 #ifdef TI_WITH_VULKAN
     case TI_ARCH_VULKAN: {
-      out = (TiRuntime)(static_cast<Runtime *>(new VulkanRuntimeOwned));
+      taichi::lang::vulkan::set_vulkan_visible_device(
+          std::to_string(device_index));
+      VulkanRuntimeOwned *vulkan_runtime;
+      if (is_ci()) {
+        auto param = make_vulkan_runtime_creator_params();
+        param.enable_validation_layer = true;
+        vulkan_runtime = new VulkanRuntimeOwned(std::move(param));
+      } else {
+        vulkan_runtime = new VulkanRuntimeOwned;
+      }
+      out = (TiRuntime)(static_cast<Runtime *>(vulkan_runtime));
       break;
     }
 #endif  // TI_WITH_VULKAN
 #ifdef TI_WITH_OPENGL
     case TI_ARCH_OPENGL: {
+      TI_CAPI_NOT_SUPPORTED_IF_RV(device_index != 0);
       out = (TiRuntime)(static_cast<Runtime *>(new OpenglRuntime));
       break;
     }
 #endif  // TI_WITH_OPENGL
 #ifdef TI_WITH_LLVM
     case TI_ARCH_X64: {
+      TI_CAPI_NOT_SUPPORTED_IF_RV(device_index != 0);
       out = (TiRuntime)(static_cast<Runtime *>(
           new capi::LlvmRuntime(taichi::Arch::x64)));
       break;
     }
     case TI_ARCH_ARM64: {
+      TI_CAPI_NOT_SUPPORTED_IF_RV(device_index != 0);
       out = (TiRuntime)(static_cast<Runtime *>(
           new capi::LlvmRuntime(taichi::Arch::arm64)));
       break;
     }
     case TI_ARCH_CUDA: {
+      TI_CAPI_NOT_SUPPORTED_IF_RV(device_index != 0);
       out = (TiRuntime)(static_cast<Runtime *>(
           new capi::LlvmRuntime(taichi::Arch::cuda)));
       break;
     }
 #endif  // TI_WITH_LLVM
+#ifdef TI_WITH_METAL
+    case TI_ARCH_METAL: {
+      TI_CAPI_NOT_SUPPORTED_IF_RV(device_index != 0);
+      out = (TiRuntime)(static_cast<Runtime *>(new capi::MetalRuntime()));
+      break;
+    }
+#endif  // TI_WITH_METAL
     default: {
       TI_CAPI_NOT_SUPPORTED(arch);
       return TI_NULL_HANDLE;
@@ -373,7 +422,8 @@ void *ti_map_memory(TiRuntime runtime, TiMemory devmem) {
   Runtime *runtime2 = (Runtime *)runtime;
   TI_ASSERT(runtime2->get().map(devmem2devalloc(*runtime2, devmem), &out) ==
                 taichi::lang::RhiResult::success &&
-            "RHI map memory failed");
+            "RHI map memory failed: "
+            "Mapping Memory without VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT set");
   TI_CAPI_TRY_CATCH_END();
   return out;
 }
@@ -468,27 +518,6 @@ void ti_destroy_sampler(TiRuntime runtime, TiSampler sampler) {
   TI_CAPI_TRY_CATCH_END();
 }
 
-TiEvent ti_create_event(TiRuntime runtime) {
-  TiEvent out = TI_NULL_HANDLE;
-  TI_CAPI_TRY_CATCH_BEGIN();
-  TI_CAPI_ARGUMENT_NULL_RV(runtime);
-
-  Runtime *runtime2 = (Runtime *)runtime;
-  std::unique_ptr<taichi::lang::DeviceEvent> event =
-      runtime2->get().create_event();
-  Event *event2 = new Event(*runtime2, std::move(event));
-  out = (TiEvent)event2;
-  TI_CAPI_TRY_CATCH_END();
-  return out;
-}
-void ti_destroy_event(TiEvent event) {
-  TI_CAPI_TRY_CATCH_BEGIN();
-  TI_CAPI_ARGUMENT_NULL(event);
-
-  delete (Event *)event;
-  TI_CAPI_TRY_CATCH_END();
-}
-
 void ti_copy_memory_device_to_device(TiRuntime runtime,
                                      const TiMemorySlice *dst_memory,
                                      const TiMemorySlice *src_memory) {
@@ -513,32 +542,30 @@ void ti_copy_memory_device_to_device(TiRuntime runtime,
   TI_CAPI_TRY_CATCH_END();
 }
 
-void ti_copy_texture_device_to_device(TiRuntime runtime,
-                                      const TiImageSlice *dst_texture,
-                                      const TiImageSlice *src_texture) {
+void ti_copy_image_device_to_device(TiRuntime runtime,
+                                    const TiImageSlice *dst_image,
+                                    const TiImageSlice *src_image) {
   TI_CAPI_TRY_CATCH_BEGIN();
   TI_CAPI_ARGUMENT_NULL(runtime);
-  TI_CAPI_ARGUMENT_NULL(dst_texture);
-  TI_CAPI_ARGUMENT_NULL(dst_texture->image);
-  TI_CAPI_ARGUMENT_NULL(src_texture);
-  TI_CAPI_ARGUMENT_NULL(src_texture->image);
-  TI_CAPI_INVALID_ARGUMENT(src_texture->extent.width !=
-                           dst_texture->extent.width);
-  TI_CAPI_INVALID_ARGUMENT(src_texture->extent.height !=
-                           dst_texture->extent.height);
-  TI_CAPI_INVALID_ARGUMENT(src_texture->extent.depth !=
-                           dst_texture->extent.depth);
-  TI_CAPI_INVALID_ARGUMENT(src_texture->extent.array_layer_count !=
-                           dst_texture->extent.array_layer_count);
+  TI_CAPI_ARGUMENT_NULL(dst_image);
+  TI_CAPI_ARGUMENT_NULL(dst_image->image);
+  TI_CAPI_ARGUMENT_NULL(src_image);
+  TI_CAPI_ARGUMENT_NULL(src_image->image);
+  TI_CAPI_INVALID_ARGUMENT(src_image->extent.width != dst_image->extent.width);
+  TI_CAPI_INVALID_ARGUMENT(src_image->extent.height !=
+                           dst_image->extent.height);
+  TI_CAPI_INVALID_ARGUMENT(src_image->extent.depth != dst_image->extent.depth);
+  TI_CAPI_INVALID_ARGUMENT(src_image->extent.array_layer_count !=
+                           dst_image->extent.array_layer_count);
 
   Runtime *runtime2 = (Runtime *)runtime;
-  auto dst = devimg2devalloc(*runtime2, dst_texture->image);
-  auto src = devimg2devalloc(*runtime2, src_texture->image);
+  auto dst = devimg2devalloc(*runtime2, dst_image->image);
+  auto src = devimg2devalloc(*runtime2, src_image->image);
 
   taichi::lang::ImageCopyParams params{};
-  params.width = dst_texture->extent.width;
-  params.height = dst_texture->extent.height;
-  params.depth = dst_texture->extent.depth;
+  params.width = dst_image->extent.width;
+  params.height = dst_image->extent.height;
+  params.depth = dst_image->extent.depth;
   runtime2->copy_image(dst, src, params);
   TI_CAPI_TRY_CATCH_END();
 }
@@ -688,20 +715,56 @@ void ti_launch_kernel(TiRuntime runtime,
   if (arg_count > 0) {
     TI_CAPI_ARGUMENT_NULL(args);
   }
+  if (arg_count > taichi_max_num_args_total) {
+    ti_set_last_error(TI_ERROR_ARGUMENT_OUT_OF_RANGE, "arg_count");
+    return;
+  }
+
+  auto ti_kernel = (taichi::lang::aot::Kernel *)kernel;
 
   Runtime &runtime2 = *((Runtime *)runtime);
-  taichi::lang::RuntimeContext &runtime_context = runtime2.runtime_context_;
+  taichi::lang::LaunchContextBuilder builder(ti_kernel);
   std::vector<std::unique_ptr<taichi::lang::DeviceAllocation>> devallocs;
 
   for (uint32_t i = 0; i < arg_count; ++i) {
     const auto &arg = args[i];
     switch (arg.type) {
+      case TI_ARGUMENT_TYPE_SCALAR: {
+        switch (arg.value.scalar.type) {
+          case TI_DATA_TYPE_I16: {
+            int16_t arg_val;
+            std::memcpy(&arg_val, &arg.value.scalar.value.x16, sizeof(arg_val));
+            builder.set_arg({(int)i}, arg_val);
+            break;
+          }
+          case TI_DATA_TYPE_U16: {
+            uint16_t arg_val = arg.value.scalar.value.x16;
+            builder.set_arg({(int)i}, arg_val);
+            break;
+          }
+          case TI_DATA_TYPE_F16: {
+            float arg_val;
+            std::memcpy(&arg_val, &arg.value.scalar.value.x32, sizeof(arg_val));
+            // FIXME: temporary workaround for f16
+            builder.set_arg_float({(int)i}, arg_val);
+            break;
+          }
+          default: {
+            ti_set_last_error(
+                TI_ERROR_ARGUMENT_OUT_OF_RANGE,
+                ("args[" + std::to_string(i) + "].value.scalar.type").c_str());
+            return;
+          }
+        }
+        break;
+      }
+
       case TI_ARGUMENT_TYPE_I32: {
-        runtime_context.set_arg(i, arg.value.i32);
+        builder.set_arg({(int)i}, arg.value.i32);
         break;
       }
       case TI_ARGUMENT_TYPE_F32: {
-        runtime_context.set_arg(i, arg.value.f32);
+        builder.set_arg({(int)i}, arg.value.f32);
         break;
       }
       case TI_ARGUMENT_TYPE_NDARRAY: {
@@ -717,13 +780,44 @@ void ti_launch_kernel(TiRuntime runtime,
         std::vector<int> shape(ndarray.shape.dims,
                                ndarray.shape.dims + ndarray.shape.dim_count);
 
-        runtime_context.set_arg_ndarray(i, (intptr_t)devalloc.get(), shape);
+        builder.set_arg_ndarray_impl({(int)i}, (intptr_t)devalloc.get(), shape);
 
         devallocs.emplace_back(std::move(devalloc));
         break;
       }
       case TI_ARGUMENT_TYPE_TEXTURE: {
-        ti_set_last_error(TI_ERROR_NOT_SUPPORTED, "TI_ARGUMENT_TYPE_TEXTURE");
+        TI_CAPI_ARGUMENT_NULL(args[i].value.texture.image);
+        std::unique_ptr<taichi::lang::DeviceAllocation> devalloc =
+            std::make_unique<taichi::lang::DeviceAllocation>(
+                devimg2devalloc(runtime2, arg.value.texture.image));
+        int width = arg.value.texture.extent.width;
+        int height = arg.value.texture.extent.height;
+        int depth = arg.value.texture.extent.depth;
+        builder.set_arg_rw_texture_impl({(int)i}, (intptr_t)devalloc.get(),
+                                        {width, height, depth});
+        devallocs.emplace_back(std::move(devalloc));
+        break;
+      }
+      case TI_ARGUMENT_TYPE_TENSOR: {
+        auto &tensor = arg.value.tensor;
+        if (tensor.type == TI_DATA_TYPE_I16 ||
+            tensor.type == TI_DATA_TYPE_U16 ||
+            tensor.type == TI_DATA_TYPE_F16) {
+          for (int j = 0; j < tensor.contents.length; j++) {
+            builder.set_struct_arg_impl({(int)i, j},
+                                        tensor.contents.data.x16[j]);
+          }
+        } else if (tensor.type == TI_DATA_TYPE_I32 ||
+                   tensor.type == TI_DATA_TYPE_U32 ||
+                   tensor.type == TI_DATA_TYPE_F32) {
+          for (int j = 0; j < tensor.contents.length; j++) {
+            builder.set_struct_arg_impl({(int)i, j},
+                                        tensor.contents.data.x32[j]);
+          }
+        } else {
+          ti_set_last_error(TI_ERROR_NOT_SUPPORTED,
+                            ("args[" + std::to_string(i) + "].type").c_str());
+        }
         break;
       }
       default: {
@@ -733,7 +827,7 @@ void ti_launch_kernel(TiRuntime runtime,
       }
     }
   }
-  ((taichi::lang::aot::Kernel *)kernel)->launch(&runtime_context);
+  ti_kernel->launch(builder);
   TI_CAPI_TRY_CATCH_END();
 }
 
@@ -754,12 +848,48 @@ void ti_launch_compute_graph(TiRuntime runtime,
   ndarrays.reserve(arg_count);
   std::vector<taichi::lang::Texture> textures;
   textures.reserve(arg_count);
+  std::vector<taichi::lang::Matrix> matrices;
+  matrices.reserve(arg_count);
 
   for (uint32_t i = 0; i < arg_count; ++i) {
     TI_CAPI_ARGUMENT_NULL(args[i].name);
 
     const auto &arg = args[i];
     switch (arg.argument.type) {
+      case TI_ARGUMENT_TYPE_SCALAR: {
+        switch (arg.argument.value.scalar.type) {
+          case TI_DATA_TYPE_I16: {
+            int16_t arg_val;
+            std::memcpy(&arg_val, &arg.argument.value.scalar.value.x16,
+                        sizeof(arg_val));
+            arg_map.emplace(std::make_pair(
+                arg.name, taichi::lang::aot::IValue::create<int16_t>(arg_val)));
+            break;
+          }
+          case TI_DATA_TYPE_U16: {
+            uint16_t arg_val = arg.argument.value.scalar.value.x16;
+            arg_map.emplace(std::make_pair(
+                arg.name,
+                taichi::lang::aot::IValue::create<uint16_t>(arg_val)));
+            break;
+          }
+          case TI_DATA_TYPE_F16: {
+            float arg_val;
+            std::memcpy(&arg_val, &arg.argument.value.scalar.value.x32,
+                        sizeof(arg_val));
+            arg_map.emplace(std::make_pair(
+                arg.name, taichi::lang::aot::IValue::create<float>(arg_val)));
+            break;
+          }
+          default: {
+            ti_set_last_error(
+                TI_ERROR_ARGUMENT_OUT_OF_RANGE,
+                ("args[" + std::to_string(i) + "].value.scalar.type").c_str());
+            return;
+          }
+        }
+        break;
+      }
       case TI_ARGUMENT_TYPE_I32: {
         arg_map.emplace(
             std::make_pair(arg.name, taichi::lang::aot::IValue::create<int32_t>(
@@ -860,6 +990,62 @@ void ti_launch_compute_graph(TiRuntime runtime,
             arg.name, taichi::lang::aot::IValue::create(textures.back())));
         break;
       }
+      case TI_ARGUMENT_TYPE_TENSOR: {
+        TI_CAPI_ARGUMENT_NULL(args[i].argument.value.tensor.contents.data.x8);
+
+        uint32_t length = arg.argument.value.tensor.contents.length;
+        const taichi::lang::DataType *prim_ty;
+        switch (arg.argument.value.tensor.type) {
+          case TI_DATA_TYPE_F16:
+            prim_ty = &taichi::lang::PrimitiveType::f16;
+            break;
+          case TI_DATA_TYPE_F32:
+            prim_ty = &taichi::lang::PrimitiveType::f32;
+            break;
+          case TI_DATA_TYPE_F64:
+            prim_ty = &taichi::lang::PrimitiveType::f64;
+            break;
+          case TI_DATA_TYPE_I8:
+            prim_ty = &taichi::lang::PrimitiveType::i8;
+            break;
+          case TI_DATA_TYPE_I16:
+            prim_ty = &taichi::lang::PrimitiveType::i16;
+            break;
+          case TI_DATA_TYPE_I32:
+            prim_ty = &taichi::lang::PrimitiveType::i32;
+            break;
+          case TI_DATA_TYPE_I64:
+            prim_ty = &taichi::lang::PrimitiveType::i64;
+            break;
+          case TI_DATA_TYPE_U8:
+            prim_ty = &taichi::lang::PrimitiveType::u8;
+            break;
+          case TI_DATA_TYPE_U16:
+            prim_ty = &taichi::lang::PrimitiveType::u16;
+            break;
+          case TI_DATA_TYPE_U32:
+            prim_ty = &taichi::lang::PrimitiveType::u32;
+            break;
+          case TI_DATA_TYPE_U64:
+            prim_ty = &taichi::lang::PrimitiveType::u64;
+            break;
+          default: {
+            ti_set_last_error(
+                TI_ERROR_ARGUMENT_OUT_OF_RANGE,
+                ("args[" + std::to_string(i) + "].argument.value.tensor.type")
+                    .c_str());
+            return;
+          }
+        }
+        intptr_t data = reinterpret_cast<intptr_t>(
+            arg.argument.value.tensor.contents.data.x8);
+
+        taichi::lang::DataType dtype = *prim_ty;
+        matrices.emplace_back(taichi::lang::Matrix(length, dtype, data));
+        arg_map.emplace(std::make_pair(
+            arg.name, taichi::lang::aot::IValue::create(matrices.back())));
+        break;
+      }
       default: {
         ti_set_last_error(
             TI_ERROR_ARGUMENT_OUT_OF_RANGE,
@@ -872,38 +1058,11 @@ void ti_launch_compute_graph(TiRuntime runtime,
   TI_CAPI_TRY_CATCH_END();
 }
 
-void ti_signal_event(TiRuntime runtime, TiEvent event) {
-  TI_CAPI_TRY_CATCH_BEGIN();
-  TI_CAPI_ARGUMENT_NULL(runtime);
-  TI_CAPI_ARGUMENT_NULL(event);
-
-  ((Runtime *)runtime)->signal_event(&((Event *)event)->get());
-  TI_CAPI_TRY_CATCH_END();
-}
-
-void ti_reset_event(TiRuntime runtime, TiEvent event) {
-  TI_CAPI_TRY_CATCH_BEGIN();
-  TI_CAPI_ARGUMENT_NULL(runtime);
-  TI_CAPI_ARGUMENT_NULL(event);
-
-  ((Runtime *)runtime)->reset_event(&((Event *)event)->get());
-  TI_CAPI_TRY_CATCH_END();
-}
-
-void ti_wait_event(TiRuntime runtime, TiEvent event) {
-  TI_CAPI_TRY_CATCH_BEGIN();
-  TI_CAPI_ARGUMENT_NULL(runtime);
-  TI_CAPI_ARGUMENT_NULL(event);
-
-  ((Runtime *)runtime)->wait_event(&((Event *)event)->get());
-  TI_CAPI_TRY_CATCH_END();
-}
-
-void ti_submit(TiRuntime runtime) {
+void ti_flush(TiRuntime runtime) {
   TI_CAPI_TRY_CATCH_BEGIN();
   TI_CAPI_ARGUMENT_NULL(runtime);
 
-  ((Runtime *)runtime)->submit();
+  ((Runtime *)runtime)->flush();
   TI_CAPI_TRY_CATCH_END();
 }
 void ti_wait(TiRuntime runtime) {

@@ -37,12 +37,10 @@ class Axis {
 struct AxisExtractor {
   /**
    * Number of elements from root at this index.
-   *
-   * This is the raw number, *not* padded to power-of-two (POT).
    */
   int num_elements_from_root{1};
   /**
-   * Shape at this index (POT or packed) according to the config.
+   * Shape at this index.
    */
   int shape{1};
   /**
@@ -50,36 +48,9 @@ struct AxisExtractor {
    */
   int acc_shape{1};
   /**
-   * Number of bits needed to store the coordinate at this index.
-   *
-   * ceil(log2(shape))
-   */
-  int num_bits{0};
-  /**
-   * Accumulated offset from the last activated index to the first one.
-   *
-   * This is the starting bit of this index in a linearized 1D coordinate. For
-   * example, assuming an SNode of (ti.ijk, shape=(4, 8, 16)). ti.i takes 2
-   * bits, ti.j 3 bits and ti.k 4 bits. Then for a linearized coordinate:
-   * ti.k uses bits [0, 4), acc_offset=0
-   * ti.j uses bits [4, 7), acc_offset=4
-   * ti.i uses bits [7, 9), acc_offset=7
-   */
-  int acc_offset{0};
-  /**
    * Whether this index (axis) is activated.
    */
   bool active{false};
-
-  /**
-   * Activates the current index.
-   *
-   * @param num_bits Number of bits needed to store the POT shape.
-   */
-  void activate(int num_bits) {
-    active = true;
-    this->num_bits = num_bits;
-  }
 };
 
 /**
@@ -124,8 +95,6 @@ class SNode {
   // See https://docs.taichi-lang.org/docs/internal for terms
   // like cell and container.
   int64 num_cells_per_container{1};
-  int total_num_bits{0};
-  int total_bit_start{0};
   int chunk_size{0};
   std::size_t cell_size_bytes{0};
   std::size_t offset_bytes_in_parent_cell{0};
@@ -164,97 +133,88 @@ class SNode {
 
   std::string get_node_type_name_hinted() const;
 
-  int get_num_bits(int physical_index) const;
-
   SNode &insert_children(SNodeType t);
 
   SNode &create_node(std::vector<Axis> axes,
                      std::vector<int> sizes,
                      SNodeType type,
-                     bool packed,
-                     const std::string &tb);
+                     const DebugInfo &dbg_info = DebugInfo());
 
   // SNodes maintains how flattened index bits are taken from indices
   SNode &dense(const std::vector<Axis> &axes,
                const std::vector<int> &sizes,
-               bool packed,
-               const std::string &tb) {
-    return create_node(axes, sizes, SNodeType::dense, packed, tb);
+               const DebugInfo &dbg_info = DebugInfo()) {
+    return create_node(axes, sizes, SNodeType::dense, dbg_info);
   }
 
   SNode &dense(const std::vector<Axis> &axes,
                int sizes,
-               bool packed,
-               const std::string &tb) {
-    return create_node(axes, std::vector<int>{sizes}, SNodeType::dense, packed,
-                       tb);
+               const DebugInfo &dbg_info = DebugInfo()) {
+    return create_node(axes, std::vector<int>{sizes}, SNodeType::dense,
+                       dbg_info);
   }
 
-  SNode &dense(const Axis &axis, int size, bool packed, const std::string &tb) {
-    return SNode::dense(std::vector<Axis>{axis}, size, packed, tb);
+  SNode &dense(const Axis &axis,
+               int size,
+               const DebugInfo &dbg_info = DebugInfo()) {
+    return SNode::dense(std::vector<Axis>{axis}, size, dbg_info);
   }
 
   SNode &pointer(const std::vector<Axis> &axes,
                  const std::vector<int> &sizes,
-                 bool packed,
-                 const std::string &tb) {
-    return create_node(axes, sizes, SNodeType::pointer, packed, tb);
+                 const DebugInfo &dbg_info = DebugInfo()) {
+    return create_node(axes, sizes, SNodeType::pointer, dbg_info);
   }
 
   SNode &pointer(const std::vector<Axis> &axes,
                  int sizes,
-                 bool packed,
-                 const std::string &tb) {
+                 const DebugInfo &dbg_info = DebugInfo()) {
     return create_node(axes, std::vector<int>{sizes}, SNodeType::pointer,
-                       packed, tb);
+                       dbg_info);
   }
 
   SNode &pointer(const Axis &axis,
                  int size,
-                 bool packed,
-                 const std::string &tb) {
-    return SNode::pointer(std::vector<Axis>{axis}, size, packed, tb);
+                 const DebugInfo &dbg_info = DebugInfo()) {
+    return SNode::pointer(std::vector<Axis>{axis}, size, dbg_info);
   }
 
   SNode &bitmasked(const std::vector<Axis> &axes,
                    const std::vector<int> &sizes,
-                   bool packed,
-                   const std::string &tb) {
-    return create_node(axes, sizes, SNodeType::bitmasked, packed, tb);
+                   const DebugInfo &dbg_info = DebugInfo()) {
+    return create_node(axes, sizes, SNodeType::bitmasked, dbg_info);
   }
 
   SNode &bitmasked(const std::vector<Axis> &axes,
                    int sizes,
-                   bool packed,
-                   const std::string &tb) {
+                   const DebugInfo &dbg_info = DebugInfo()) {
     return create_node(axes, std::vector<int>{sizes}, SNodeType::bitmasked,
-                       packed, tb);
+                       dbg_info);
   }
 
   SNode &bitmasked(const Axis &axis,
                    int size,
-                   bool packed,
-                   const std::string &tb) {
-    return SNode::bitmasked(std::vector<Axis>{axis}, size, packed, tb);
+                   const DebugInfo &dbg_info = DebugInfo()) {
+    return SNode::bitmasked(std::vector<Axis>{axis}, size, dbg_info);
   }
 
   SNode &hash(const std::vector<Axis> &axes,
               const std::vector<int> &sizes,
-              bool packed,
-              const std::string &tb) {
-    return create_node(axes, sizes, SNodeType::hash, packed, tb);
+              const DebugInfo &dbg_info = DebugInfo()) {
+    return create_node(axes, sizes, SNodeType::hash, dbg_info);
   }
 
   SNode &hash(const std::vector<Axis> &axes,
               int sizes,
-              bool packed,
-              const std::string &tb) {
-    return create_node(axes, std::vector<int>{sizes}, SNodeType::hash, packed,
-                       tb);
+              const DebugInfo &dbg_info = DebugInfo()) {
+    return create_node(axes, std::vector<int>{sizes}, SNodeType::hash,
+                       dbg_info);
   }
 
-  SNode &hash(const Axis &axis, int size, bool packed, const std::string &tb) {
-    return hash(std::vector<Axis>{axis}, size, packed, tb);
+  SNode &hash(const Axis &axis,
+              int size,
+              const DebugInfo &dbg_info = DebugInfo()) {
+    return hash(std::vector<Axis>{axis}, size, dbg_info);
   }
 
   std::string type_name() {
@@ -262,14 +222,12 @@ class SNode {
   }
 
   SNode &bit_struct(BitStructType *bit_struct_type,
-                    bool packed,
-                    const std::string &tb);
+                    const DebugInfo &dbg_info = DebugInfo());
 
   SNode &quant_array(const std::vector<Axis> &axes,
                      const std::vector<int> &sizes,
                      int bits,
-                     bool packed,
-                     const std::string &tb);
+                     const DebugInfo &dbg_info = DebugInfo());
 
   void print();
 
@@ -278,8 +236,7 @@ class SNode {
   SNode &dynamic(const Axis &expr,
                  int n,
                  int chunk_size,
-                 bool packed,
-                 const std::string &tb);
+                 const DebugInfo &dbg_info = DebugInfo());
 
   SNode &morton(bool val = true) {
     _morton = val;
@@ -373,6 +330,7 @@ class SNode {
   uint64 read_uint(const std::vector<int> &i);
   float64 read_float(const std::vector<int> &i);
   void write_int(const std::vector<int> &i, int64 val);
+  void write_uint(const std::vector<int> &i, uint64 val);
   void write_float(const std::vector<int> &i, float64 val);
 
   Expr get_expr() const;
@@ -385,6 +343,8 @@ class SNode {
 
   int get_snode_tree_id() const;
 
+  const SNode *get_root() const;
+
   static void reset_counter() {
     counter = 0;
   }
@@ -392,7 +352,8 @@ class SNode {
  private:
   int snode_tree_id_{0};
   SNodeFieldMap *snode_to_fields_{nullptr};
-  SNodeRwAccessorsBank *snode_rw_accessors_bank_{nullptr};
+  SNodeRwAccessorsBank *snode_rw_accessors_bank_{
+      nullptr};  // owned by the "Program" class
 };
 
 }  // namespace taichi::lang

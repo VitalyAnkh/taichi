@@ -7,7 +7,6 @@
 #ifdef TI_WITH_LLVM
 
 #include "taichi/ir/ir.h"
-#include "taichi/runtime/llvm/launch_arg_info.h"
 #include "taichi/codegen/llvm/llvm_codegen_utils.h"
 #include "taichi/codegen/llvm/llvm_compiled_data.h"
 #include "taichi/program/program.h"
@@ -33,7 +32,8 @@ class FunctionCreationGuard {
 
 class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
  public:
-  Kernel *kernel;
+  const CompileConfig &compile_config;
+  const Kernel *kernel;
   IRNode *ir;
   Program *prog;
   std::string kernel_name;
@@ -60,7 +60,10 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
   bool returned{false};
   std::unordered_set<int> used_tree_ids;
   std::unordered_set<int> struct_for_tls_sizes;
-  Function *now_real_func{nullptr};
+  const Callable *current_callable{nullptr};
+
+  // The task_codegen_id represents the id of the offloaded task
+  int task_codegen_id{0};
 
   std::unordered_map<const Stmt *, std::vector<llvm::Value *>> loop_vars_llvm;
 
@@ -69,17 +72,30 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
   using IRVisitor::visit;
   using LLVMModuleBuilder::call;
 
-  explicit TaskCodeGenLLVM(Kernel *kernel,
-                           IRNode *ir = nullptr,
+  explicit TaskCodeGenLLVM(int id,
+                           const CompileConfig &config,
+                           TaichiLLVMContext &tlctx,
+                           const Kernel *kernel,
+                           IRNode *ir,
                            std::unique_ptr<llvm::Module> &&module = nullptr);
 
-  Arch current_arch() {
-    return kernel->arch;
+  Arch current_arch() const {
+    return compile_config.arch;
   }
 
   void initialize_context();
 
   llvm::Value *get_arg(int i);
+
+  llvm::Value *get_argpack_arg(const std::vector<int> &index,
+                               int arg_depth,
+                               bool create_load);
+
+  llvm::Value *get_struct_arg(const std::vector<int> &index, bool create_load);
+
+  llvm::Value *get_args_ptr(const Callable *callable, llvm::Value *context);
+
+  void set_args_ptr(Callable *callable, llvm::Value *context, llvm::Value *ptr);
 
   llvm::Value *get_context();
 
@@ -95,7 +111,9 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
 
   llvm::Type *get_mesh_xlogue_function_type();
 
-  llvm::Type *get_real_func_ret_type(Function *real_func);
+  llvm::PointerType *get_integer_ptr_type(int bits);
+
+  llvm::IntegerType *get_integer_type(int bits);
 
   llvm::Value *get_root(int snode_tree_id);
 
@@ -138,6 +156,10 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
 
   llvm::Value *create_print(std::string tag, llvm::Value *value);
 
+  void set_struct_to_buffer(const StructType *struct_type,
+                            llvm::Value *buffer,
+                            const std::vector<Stmt *> &elements);
+
   llvm::Value *cast_pointer(llvm::Value *val,
                             std::string dest_ty_name,
                             int addr_space = 0);
@@ -145,7 +167,6 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
   void emit_list_gen(OffloadedStmt *listgen);
 
   void emit_gc(OffloadedStmt *stmt);
-  void emit_gc_rc();
 
   llvm::Value *call(SNode *snode,
                     llvm::Value *node_ptr,
@@ -230,7 +251,8 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
   virtual llvm::Value *atomic_op_using_cas(
       llvm::Value *output_address,
       llvm::Value *val,
-      std::function<llvm::Value *(llvm::Value *, llvm::Value *)> op);
+      std::function<llvm::Value *(llvm::Value *, llvm::Value *)> op,
+      const DataType &type);
 
   virtual llvm::Value *real_type_atomic(AtomicOpStmt *stmt);
 
@@ -292,8 +314,6 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
 
   void visit(GetRootStmt *stmt) override;
 
-  void visit(BitExtractStmt *stmt) override;
-
   void visit(LinearizeStmt *stmt) override;
 
   void visit(IntegerOffsetStmt *stmt) override;
@@ -309,6 +329,8 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
   void visit(ExternalPtrStmt *stmt) override;
 
   void visit(ExternalTensorShapeAlongAxisStmt *stmt) override;
+
+  void visit(ExternalTensorBasePtrStmt *stmt) override;
 
   virtual bool kernel_argument_by_val() const {
     return false;  // on CPU devices just pass in a pointer
@@ -332,7 +354,7 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
     TI_NOT_IMPLEMENTED;
   }
 
-  void create_offload_struct_for(OffloadedStmt *stmt, bool spmd = false);
+  void create_offload_struct_for(OffloadedStmt *stmt);
 
   void visit(LoopIndexStmt *stmt) override;
 
@@ -402,6 +424,16 @@ class TaskCodeGenLLVM : public IRVisitor, public LLVMModuleBuilder {
   llvm::Value *bitcast_to_u64(llvm::Value *val, DataType type);
 
   ~TaskCodeGenLLVM() override = default;
+
+ private:
+  void set_struct_to_buffer(llvm::Value *buffer,
+                            llvm::Type *buffer_type,
+                            const std::vector<Stmt *> &elements,
+                            const Type *current_type,
+                            int &current_element,
+                            std::vector<llvm::Value *> &current_index);
+
+  virtual std::tuple<llvm::Value *, llvm::Value *> get_spmd_info() = 0;
 };
 
 }  // namespace taichi::lang

@@ -1,6 +1,6 @@
 #include "taichi/program/sparse_matrix.h"
 
-#include <unordered_map>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -85,35 +85,79 @@ SparseMatrixBuilder::SparseMatrixBuilder(int rows,
                                          int cols,
                                          int max_num_triplets,
                                          DataType dtype,
-                                         const std::string &storage_format,
-                                         Program *prog)
+                                         const std::string &storage_format)
     : rows_(rows),
       cols_(cols),
       max_num_triplets_(max_num_triplets),
       dtype_(dtype),
-      storage_format_(storage_format),
-      prog_(prog) {
+      storage_format_(storage_format) {
   auto element_size = data_type_size(dtype);
   TI_ASSERT((element_size == 4 || element_size == 8));
-  ndarray_data_base_ptr_ = std::make_unique<Ndarray>(
-      prog_, dtype_, std::vector<int>{3 * (int)max_num_triplets_ + 1});
 }
 
-void SparseMatrixBuilder::print_triplets() {
-  num_triplets_ = ndarray_data_base_ptr_->read_int(std::vector<int>{0});
+SparseMatrixBuilder::~SparseMatrixBuilder() = default;
+
+void SparseMatrixBuilder::create_ndarray(Program *prog) {
+  ndarray_data_base_ptr_ = prog->create_ndarray(
+      dtype_, std::vector<int>{3 * (int)max_num_triplets_ + 1});
+  ndarray_data_ptr_ = prog->get_ndarray_data_ptr_as_int(ndarray_data_base_ptr_);
+}
+
+void SparseMatrixBuilder::delete_ndarray(Program *prog) {
+  prog->delete_ndarray(ndarray_data_base_ptr_);
+}
+
+template <typename T, typename G>
+void SparseMatrixBuilder::print_triplets_template() {
+  auto ptr = get_ndarray_data_ptr();
+  G *data = reinterpret_cast<G *>(ptr);
+  num_triplets_ = data[0];
   fmt::print("n={}, m={}, num_triplets={} (max={})\n", rows_, cols_,
              num_triplets_, max_num_triplets_);
+  data += 1;
   for (int i = 0; i < num_triplets_; i++) {
-    auto idx = 3 * i + 1;
-    auto row = ndarray_data_base_ptr_->read_int(std::vector<int>{idx});
-    auto col = ndarray_data_base_ptr_->read_int(std::vector<int>{idx + 1});
-    auto val = ndarray_data_base_ptr_->read_float(std::vector<int>{idx + 2});
-    fmt::print("[{}, {}] = {}\n", row, col, val);
+    fmt::print("[{}, {}] = {}\n", data[i * 3], data[i * 3 + 1],
+               taichi_union_cast<T>(data[i * 3 + 2]));
   }
 }
 
+void SparseMatrixBuilder::print_triplets_eigen() {
+  auto element_size = data_type_size(dtype_);
+  switch (element_size) {
+    case 4:
+      print_triplets_template<float32, int32>();
+      break;
+    case 8:
+      print_triplets_template<float64, int64>();
+      break;
+    default:
+      TI_ERROR("Unsupported sparse matrix data type!");
+      break;
+  }
+}
+
+void SparseMatrixBuilder::print_triplets_cuda() {
+#ifdef TI_WITH_CUDA
+  CUDADriver::get_instance().memcpy_device_to_host(
+      &num_triplets_, (void *)get_ndarray_data_ptr(), sizeof(int));
+  fmt::print("n={}, m={}, num_triplets={} (max={})\n", rows_, cols_,
+             num_triplets_, max_num_triplets_);
+  auto len = 3 * num_triplets_ + 1;
+  std::vector<float32> trips(len);
+  CUDADriver::get_instance().memcpy_device_to_host(
+      (void *)trips.data(), (void *)get_ndarray_data_ptr(),
+      len * sizeof(float32));
+  for (auto i = 0; i < num_triplets_; i++) {
+    int row = taichi_union_cast<int>(trips[3 * i + 1]);
+    int col = taichi_union_cast<int>(trips[3 * i + 2]);
+    auto val = trips[i * 3 + 3];
+    fmt::print("[{}, {}] = {}\n", row, col, val);
+  }
+#endif
+}
+
 intptr_t SparseMatrixBuilder::get_ndarray_data_ptr() const {
-  return prog_->get_ndarray_data_ptr_as_int(ndarray_data_base_ptr_.get());
+  return ndarray_data_ptr_;
 }
 
 template <typename T, typename G>
@@ -222,6 +266,21 @@ const std::string EigenSparseMatrix<EigenMatrix>::to_string() const {
   std::ostringstream ostr;
   ostr << Eigen::MatrixXf(matrix_.template cast<float>()).format(clean_fmt);
   return ostr.str();
+}
+
+template <class EigenMatrix>
+void EigenSparseMatrix<EigenMatrix>::mmwrite(const std::string &filename) {
+  std::ofstream file(filename);
+  file << "%%MatrixMarket matrix coordinate real general\n%" << std::endl;
+  file << matrix_.rows() << " " << matrix_.cols() << " " << matrix_.nonZeros()
+       << std::endl;
+  for (int k = 0; k < matrix_.outerSize(); ++k) {
+    for (typename EigenMatrix::InnerIterator it(matrix_, k); it; ++it) {
+      file << it.row() + 1 << " " << it.col() + 1 << " " << it.value()
+           << std::endl;
+    }
+  }
+  file.close();
 }
 
 template <class EigenMatrix>
@@ -697,11 +756,8 @@ std::unique_ptr<SparseMatrix> CuSparseMatrix::transpose() const {
 #endif
 }
 
-void CuSparseMatrix::spmv(Program *prog, const Ndarray &x, const Ndarray &y) {
+void CuSparseMatrix::spmv(size_t dX, size_t dY) {
 #if defined(TI_WITH_CUDA)
-  size_t dX = prog->get_ndarray_data_ptr_as_int(&x);
-  size_t dY = prog->get_ndarray_data_ptr_as_int(&y);
-
   cusparseDnVecDescr_t vecX, vecY;
   CUSPARSEDriver::get_instance().cpCreateDnVec(&vecX, cols_, (void *)dX,
                                                CUDA_R_32F);
@@ -727,6 +783,16 @@ void CuSparseMatrix::spmv(Program *prog, const Ndarray &x, const Ndarray &y) {
   CUSPARSEDriver::get_instance().cpDestroyDnVec(vecY);
   CUSPARSEDriver::get_instance().cpDestroy(cusparse_handle);
   CUDADriver::get_instance().mem_free(dBuffer);
+#endif
+}
+
+void CuSparseMatrix::nd_spmv(Program *prog,
+                             const Ndarray &x,
+                             const Ndarray &y) {
+#if defined(TI_WITH_CUDA)
+  size_t dX = prog->get_ndarray_data_ptr_as_int(&x);
+  size_t dY = prog->get_ndarray_data_ptr_as_int(&y);
+  spmv(dX, dY);
 #endif
 }
 
@@ -796,6 +862,44 @@ float CuSparseMatrix::get_element(int row, int col) const {
   delete[] hV;
 #endif  // TI_WITH_CUDA
   return res;
+}
+
+void CuSparseMatrix::mmwrite(const std::string &filename) {
+#ifdef TI_WITH_CUDA
+  size_t rows, cols, nnz;
+  float *dR;
+  int *dC, *dV;
+  cusparseIndexType_t row_type, column_type;
+  cusparseIndexBase_t idx_base;
+  cudaDataType value_type;
+  CUSPARSEDriver::get_instance().cpCsrGet(
+      matrix_, &rows, &cols, &nnz, (void **)&dR, (void **)&dC, (void **)&dV,
+      &row_type, &column_type, &idx_base, &value_type);
+
+  auto *hR = new int[rows + 1];
+  auto *hC = new int[nnz];
+  auto *hV = new float[nnz];
+
+  CUDADriver::get_instance().memcpy_device_to_host((void *)hR, (void *)dR,
+                                                   (rows + 1) * sizeof(int));
+  CUDADriver::get_instance().memcpy_device_to_host((void *)hC, (void *)dC,
+                                                   (nnz) * sizeof(int));
+  CUDADriver::get_instance().memcpy_device_to_host((void *)hV, (void *)dV,
+                                                   (nnz) * sizeof(float));
+
+  std::ofstream file(filename);
+  file << "%%MatrixMarket matrix coordinate real general\n%" << std::endl;
+  file << rows << " " << cols << " " << nnz << std::endl;
+  for (int r = 0; r < rows; r++) {
+    for (int c = hR[r]; c < hR[r + 1]; c++) {
+      file << r + 1 << " " << hC[c] + 1 << " " << hV[c] << std::endl;
+    }
+  }
+  file.close();
+  delete[] hR;
+  delete[] hC;
+  delete[] hV;
+#endif
 }
 
 }  // namespace taichi::lang

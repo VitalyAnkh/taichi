@@ -1,5 +1,4 @@
-from generate_c_api import (get_declr, get_title,
-                            resolve_inline_symbols_to_names)
+from generate_c_api import get_declr, get_title, resolve_inline_symbols_to_names
 from taichi_json import BuiltInType, Module
 
 
@@ -15,6 +14,12 @@ def print_module_doc(module: Module):
     for x in module.declr_reg:
         declr = module.declr_reg.resolve(x)
 
+        # Ignore interfaces with no valid publish version.
+        if declr.since is None:
+            continue
+        else:
+            assert x in module.doc.api_full_refs, f"undocumented public api is not allowed: {x}"
+
         if is_first:
             is_first = False
         else:
@@ -22,6 +27,8 @@ def print_module_doc(module: Module):
 
         out += [
             f"### {get_title(declr)}",
+            "",
+            f"> Stable since Taichi version: {declr.since}",
             "",
             "```c",
             f"// {x}",
@@ -35,9 +42,11 @@ def print_module_doc(module: Module):
         else:
             print(f"WARNING: `{x}` is not documented")
             out += [""]
-    out += [""]
 
-    return '\n'.join(out)
+    if out[-1]:
+        out += [""]
+
+    return "\n".join(out)
 
 
 def generate_module_header(module):
@@ -49,7 +58,7 @@ def generate_module_header(module):
     with open(path, "w") as f:
         f.write(print_module_doc(module))
 
-    #system(f"clang-format {path} -i")
+    # system(f"clang-format {path} -i")
 
 
 if __name__ == "__main__":
@@ -58,6 +67,10 @@ if __name__ == "__main__":
         BuiltInType("int64_t", "int64_t"),
         BuiltInType("uint32_t", "uint32_t"),
         BuiltInType("int32_t", "int32_t"),
+        BuiltInType("uint16_t", "uint16_t"),
+        BuiltInType("int16_t", "int16_t"),
+        BuiltInType("uint8_t", "uint8_t"),
+        BuiltInType("int8_t", "int8_t"),
         BuiltInType("float", "float"),
         BuiltInType("const char*", "const char*"),
         BuiltInType("const char**", "const char**"),
@@ -83,6 +96,9 @@ if __name__ == "__main__":
         BuiltInType("char", "char"),
         BuiltInType("GLuint", "GLuint"),
         BuiltInType("VkDeviceMemory", "VkDeviceMemory"),
+        BuiltInType("GLenum", "GLenum"),
+        BuiltInType("GLsizei", "GLsizei"),
+        BuiltInType("GLsizeiptr", "GLsizeiptr"),
     }
 
     for module in Module.load_all(builtin_tys):

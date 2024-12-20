@@ -2,187 +2,119 @@ import math
 import tempfile
 
 import pytest
+from taichi._lib import core as _ti_core
 
 import taichi as ti
 from tests import test_utils
 
 
-@test_utils.test(arch=[ti.vulkan, ti.opengl, ti.cuda, ti.cpu])
-def test_deprecated_aot_save_filename():
-    density = ti.field(float, shape=(4, 4))
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        m = ti.aot.Module()
-        m.add_field('density', density)
-        with pytest.warns(
-                DeprecationWarning,
-                match=
-                r'Specifying filename is no-op and will be removed in release v1.4.0'
-        ):
-            m.save(tmpdir, 'filename')
+@test_utils.test()
+def test_remove_element_shape_scalar():
+    with pytest.raises(
+        ti.TaichiRuntimeError,
+        match="The element_shape argument for scalar is deprecated in v1.6.0, and is removed in v1.7.0. "
+        "Please remove them.",
+    ):
+        sym_x = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "x", dtype=ti.f32, element_shape=())
 
 
 @test_utils.test()
-def test_deprecated_matrix_rotation2d():
-    with pytest.warns(
-            DeprecationWarning,
-            match=
-            r'`ti.Matrix.rotation2d\(\)` will be removed in release v1.4.0. Use `ti.math.rotation2d\(\)` instead.'
+def test_remove_element_shape_ndarray_arg():
+    with pytest.raises(
+        ti.TaichiRuntimeError,
+        match="The element_shape argument for ndarray is deprecated in v1.6.0, and it is removed in v1.7.0. "
+        "Please use vector or matrix data type instead.",
     ):
-        a = ti.Matrix.rotation2d(math.pi / 2)
+        ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "x", ti.f32, ndim=1, element_shape=(1,))
 
 
 @test_utils.test()
-def test_deprecate_element_shape_ndarray_annotation():
-    with pytest.warns(
-            DeprecationWarning,
-            match=
-            'The element_dim and element_shape arguments for ndarray will be deprecated in v1.4.0, use matrix dtype instead.'
+def test_remove_texture_channel_format_num_channels():
+    with pytest.raises(
+        ti.TaichiRuntimeError,
+        match="The channel_format and num_channels arguments are no longer required for non-RW textures "
+        "since v1.6.0, and they are removed in v1.7.0. Please remove them.",
     ):
-
-        @ti.kernel
-        def func(x: ti.types.ndarray(element_shape=(3, ))):
-            pass
+        ti.graph.Arg(ti.graph.ArgKind.TEXTURE, "x", ndim=2, channel_format=ti.f32, num_channels=1)
 
 
 @test_utils.test()
-def test_deprecate_element_dim_ndarray_annotation():
-    with pytest.warns(
-            DeprecationWarning,
-            match=
-            'The element_dim and element_shape arguments for ndarray will be deprecated in v1.4.0, use matrix dtype instead.'
+def test_remove_rwtexture_channel_format_num_channels():
+    with pytest.raises(
+        ti.TaichiRuntimeError,
+        match="The channel_format and num_channels arguments for texture are deprecated in v1.6.0, "
+        "and they are removed in v1.7.0. Please use fmt instead.",
     ):
-
-        @ti.kernel
-        def func(x: ti.types.ndarray(element_dim=2)):
-            pass
+        ti.graph.Arg(
+            ti.graph.ArgKind.RWTEXTURE,
+            "x",
+            ndim=2,
+            channel_format=ti.f32,
+            num_channels=1,
+        )
 
 
 @test_utils.test()
-def test_deprecate_field_dim_ndarray_annotation():
-    with pytest.warns(
-            DeprecationWarning,
-            match=
-            "The field_dim argument for ndarray will be deprecated in v1.4.0, use ndim instead."
-    ):
-
-        @ti.kernel
-        def func(x: ti.types.ndarray(field_dim=(16, 16))):
-            pass
-
-
-@test_utils.test(arch=ti.metal)
-def test_deprecate_metal_sparse():
-    with pytest.warns(
-            DeprecationWarning,
-            match=
-            "Pointer SNode on metal backend is deprecated, and it will be removed in v1.4.0."
-    ):
-        a = ti.root.pointer(ti.i, 10)
-    with pytest.warns(
-            DeprecationWarning,
-            match=
-            "Bitmasked SNode on metal backend is deprecated, and it will be removed in v1.4.0."
-    ):
-        b = a.bitmasked(ti.j, 10)
-
+def test_remove_texture_ndim():
     with pytest.raises(
-            ti.TaichiRuntimeError,
-            match=
-            "Dynamic SNode on metal backend is deprecated and removed in this release."
+        ti.TaichiRuntimeError,
+        match=r"The shape argument for texture is deprecated in v1.6.0, and it is removed in v1.7.0. "
+        r"Please use ndim instead. \(Note that you no longer need the exact texture size.\)",
     ):
-        ti.root.dynamic(ti.i, 10)
+        ti.graph.Arg(ti.graph.ArgKind.TEXTURE, "x", shape=(128, 128), channel_format=ti.f32)
 
 
-def test_deprecated_packed_true():
-    with pytest.warns(
-            DeprecationWarning,
-            match=
-            "Currently packed=True is the default setting and the switch will be removed in v1.4.0."
-    ):
-        ti.init(packed=True)
-
-
-def test_deprecated_packed_false():
-    with pytest.warns(
-            DeprecationWarning,
-            match=
-            r"The automatic padding mode \(packed=False\) will no longer exist in v1.4.0. The switch will "
-            "also be removed then. Make sure your code doesn't rely on it."):
-        ti.init(packed=False)
-
-
-@test_utils.test(arch=ti.vulkan)
-def test_deprecated_rwtexture_type():
-    n = 128
-
-    with pytest.warns(
-            DeprecationWarning,
-            match=
-            r"Specifying num_channels and channel_format is deprecated and will be removed in v1.5.0, please specify fmt instead"
-    ):
-
-        @ti.kernel
-        def ker(tex: ti.types.rw_texture(num_dimensions=2,
-                                         num_channels=1,
-                                         channel_format=ti.f32,
-                                         lod=0)):
-            for i, j in ti.ndrange(n, n):
-                ret = ti.cast(1, ti.f32)
-                tex.store(ti.Vector([i, j]), ti.Vector([ret, 0.0, 0.0, 0.0]))
-
-
-@test_utils.test(arch=ti.vulkan)
-def test_incomplete_info_rwtexture():
-    n = 128
-
+@test_utils.test()
+def test_remove_rwtexture_ndim():
     with pytest.raises(
-            ti.TaichiCompilationError,
-            match=r"Incomplete type info for rw_texture, please specify its fmt"
+        ti.TaichiRuntimeError,
+        match=r"The shape argument for texture is deprecated in v1.6.0, and it is removed in v1.7.0. "
+        r"Please use ndim instead. \(Note that you no longer need the exact texture size.\)",
     ):
-
-        @ti.kernel
-        def ker(tex: ti.types.rw_texture(num_dimensions=2,
-                                         channel_format=ti.f32,
-                                         lod=0)):
-            for i, j in ti.ndrange(n, n):
-                ret = ti.cast(1, ti.f32)
-                tex.store(ti.Vector([i, j]), ti.Vector([ret, 0.0, 0.0, 0.0]))
-
-    with pytest.raises(
-            ti.TaichiCompilationError,
-            match=r"Incomplete type info for rw_texture, please specify its fmt"
-    ):
-
-        @ti.kernel
-        def ker(tex: ti.types.rw_texture(num_dimensions=2,
-                                         num_channels=2,
-                                         lod=0)):
-            for i, j in ti.ndrange(n, n):
-                ret = ti.cast(1, ti.f32)
-                tex.store(ti.Vector([i, j]), ti.Vector([ret, 0.0, 0.0, 0.0]))
-
-    with pytest.raises(
-            ti.TaichiCompilationError,
-            match=r"Incomplete type info for rw_texture, please specify its fmt"
-    ):
-
-        @ti.kernel
-        def ker(tex: ti.types.rw_texture(num_dimensions=2, lod=0)):
-            for i, j in ti.ndrange(n, n):
-                ret = ti.cast(1, ti.f32)
-                tex.store(ti.Vector([i, j]), ti.Vector([ret, 0.0, 0.0, 0.0]))
+        ti.graph.Arg(ti.graph.ArgKind.RWTEXTURE, "x", shape=(128, 128), fmt=ti.Format.r32f)
 
 
-def test_deprecated_source_inspect():
-    with pytest.warns(DeprecationWarning,
-                      match="Sourceinspect is deprecated since v1.4.0"):
-        import os
-        os.environ['USE_SOURCEINSPECT'] = '1'
-        from taichi.lang._wrap_inspect import getsourcelines
+@test_utils.test()
+def test_remove_is_is_not():
+    with pytest.raises(ti.TaichiSyntaxError, match='Operator "is" in Taichi scope is not supported'):
 
         @ti.kernel
         def func():
-            pass
+            ti.static(1 is 2)
 
-        print(getsourcelines(func))
+        func()
+
+
+@pytest.mark.skipif(not _ti_core.GGUI_AVAILABLE, reason="GGUI Not Available")
+@test_utils.test()
+def test_deprecate_initialization_of_scene():
+    with pytest.warns(
+        DeprecationWarning,
+        match=r"Instantiating ti.ui.Scene directly is deprecated, use the get_scene\(\) function from a taichi.ui.Window object instead.",
+    ):
+        ti.ui.Scene()
+
+
+@test_utils.test(arch=[ti.cpu, ti.cuda])
+def test_deprecate_experimental_real_func():
+    with pytest.warns(
+        DeprecationWarning,
+        match="ti.experimental.real_func is deprecated because it is no longer experimental. "
+        "Use ti.real_func instead.",
+    ):
+
+        @ti.experimental.real_func
+        def foo(a: ti.i32) -> ti.i32:
+            s = 0
+            for i in range(100):
+                if i == a + 1:
+                    return s
+                s = s + i
+            return s
+
+        @ti.kernel
+        def bar(a: ti.i32) -> ti.i32:
+            return foo(a)
+
+        assert bar(10) == 11 * 5
+        assert bar(200) == 99 * 50

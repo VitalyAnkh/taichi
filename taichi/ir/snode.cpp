@@ -37,45 +37,51 @@ SNode &SNode::insert_children(SNodeType t) {
 SNode &SNode::create_node(std::vector<Axis> axes,
                           std::vector<int> sizes,
                           SNodeType type,
-                          bool packed,
-                          const std::string &tb) {
-  TI_ASSERT(axes.size() == sizes.size() || sizes.size() == 1);
+                          const DebugInfo &dbg_info) {
   if (sizes.size() == 1) {
     sizes = std::vector<int>(axes.size(), sizes[0]);
   }
+  if (axes.size() != sizes.size()) {
+    ErrorEmitter(
+        TaichiRuntimeError(), &dbg_info,
+        fmt::format(
+            "axes and sizes must have the same size, but got {} and {}.",
+            axes.size(), sizes.size()));
+  }
 
-  if (type == SNodeType::hash)
-    TI_ASSERT_INFO(depth == 0,
-                   "hashed node must be child of root due to initialization "
-                   "memset limitation.");
+  if (type == SNodeType::hash && depth != 0) {
+    ErrorEmitter(TaichiRuntimeError(), &dbg_info,
+                 "hashed node must be child of root due to initialization "
+                 "memset limitation.");
+  }
 
   auto &new_node = insert_children(type);
   for (int i = 0; i < (int)axes.size(); i++) {
     if (sizes[i] <= 0) {
-      throw TaichiRuntimeError(
-          "Every dimension of a Taichi field should be positive");
+      ErrorEmitter(TaichiRuntimeError(), &dbg_info,
+                   fmt::format("Every dimension of a Taichi field should be "
+                               "positive, got {} in demension {}.",
+                               sizes[i], i));
     }
+
     int ind = axes[i].value;
     auto end = new_node.physical_index_position + new_node.num_active_indices;
     bool is_first_division =
         std::find(new_node.physical_index_position, end, ind) == end;
     if (is_first_division) {
       new_node.physical_index_position[new_node.num_active_indices++] = ind;
-    } else {
-      TI_WARN_IF(
-          packed && !bit::is_power_of_two(sizes[i]),
-          "Shape {} is detected on non-first division of axis {}:\n{} For "
-          "best performance, we recommend that you set it to a power of two.",
-          sizes[i], char('i' + ind), tb);
+    } else if (!bit::is_power_of_two(sizes[i])) {
+      ErrorEmitter(
+          TaichiRuntimeWarning(), &dbg_info,
+          fmt::format(
+              "Shape {} is detected on non-first division of axis {}. For "
+              "best performance, we recommend that you set it to a power of "
+              "two.",
+              sizes[i], char('i' + ind)));
     }
-    new_node.extractors[ind].activate(
-        bit::log2int(bit::least_pot_bound(sizes[i])));
+    new_node.extractors[ind].active = true;
     new_node.extractors[ind].num_elements_from_root *= sizes[i];
-    if (packed) {
-      new_node.extractors[ind].shape = sizes[i];
-    } else {  // if not in packed mode, pad shape to POT
-      new_node.extractors[ind].shape = 1 << new_node.extractors[ind].num_bits;
-    }
+    new_node.extractors[ind].shape = sizes[i];
   }
   std::sort(new_node.physical_index_position,
             new_node.physical_index_position + new_node.num_active_indices);
@@ -87,42 +93,33 @@ SNode &SNode::create_node(std::vector<Axis> axes,
     acc_shape *= new_node.extractors[i].shape;
   }
   if (acc_shape > std::numeric_limits<int>::max()) {
-    TI_WARN(
+    ErrorEmitter(
+        TaichiIndexWarning(), &dbg_info,
         "SNode index might be out of int32 boundary but int64 indexing is not "
         "supported yet. Struct fors might not work either.");
   }
   new_node.num_cells_per_container = acc_shape;
-  // infer extractors (only for POT)
-  int acc_offsets = 0;
-  for (int i = taichi_max_num_indices - 1; i >= 0; i--) {
-    new_node.extractors[i].acc_offset = acc_offsets;
-    acc_offsets += new_node.extractors[i].num_bits;
-  }
-  new_node.total_num_bits = acc_offsets;
-
-  constexpr int kMaxTotalNumBits = 64;
-  TI_ERROR_IF(
-      new_node.total_num_bits >= kMaxTotalNumBits,
-      "SNode={}: total_num_bits={} exceeded limit={}. This implies that "
-      "your requested shape is too large.",
-      new_node.id, new_node.total_num_bits, kMaxTotalNumBits);
 
   if (new_node.type == SNodeType::dynamic) {
     int active_extractor_counder = 0;
     for (int i = 0; i < taichi_max_num_indices; i++) {
-      if (new_node.extractors[i].num_bits != 0) {
+      if (new_node.extractors[i].active) {
         active_extractor_counder += 1;
         SNode *p = new_node.parent;
         while (p) {
-          TI_ASSERT_INFO(
-              p->extractors[i].num_bits == 0,
-              "Dynamic SNode must have a standalone dimensionality.");
+          if (p->extractors[i].active) {
+            ErrorEmitter(
+                TaichiRuntimeError(), &dbg_info,
+                "Dynamic SNode must have a standalone dimensionality.");
+          }
           p = p->parent;
         }
       }
     }
-    TI_ASSERT_INFO(active_extractor_counder == 1,
+    if (active_extractor_counder != 1) {
+      ErrorEmitter(TaichiRuntimeError(), &dbg_info,
                    "Dynamic SNode can have only one index extractor.");
+    }
   }
   return new_node;
 }
@@ -130,17 +127,15 @@ SNode &SNode::create_node(std::vector<Axis> axes,
 SNode &SNode::dynamic(const Axis &expr,
                       int n,
                       int chunk_size,
-                      bool packed,
-                      const std::string &tb) {
-  auto &snode = create_node({expr}, {n}, SNodeType::dynamic, packed, tb);
+                      const DebugInfo &dbg_info) {
+  auto &snode = create_node({expr}, {n}, SNodeType::dynamic, dbg_info);
   snode.chunk_size = chunk_size;
   return snode;
 }
 
 SNode &SNode::bit_struct(BitStructType *bit_struct_type,
-                         bool packed,
-                         const std::string &tb) {
-  auto &snode = create_node({}, {}, SNodeType::bit_struct, packed, tb);
+                         const DebugInfo &dbg_info) {
+  auto &snode = create_node({}, {}, SNodeType::bit_struct, dbg_info);
   snode.dt = bit_struct_type;
   snode.physical_type = bit_struct_type->get_physical_type();
   return snode;
@@ -149,9 +144,8 @@ SNode &SNode::bit_struct(BitStructType *bit_struct_type,
 SNode &SNode::quant_array(const std::vector<Axis> &axes,
                           const std::vector<int> &sizes,
                           int bits,
-                          bool packed,
-                          const std::string &tb) {
-  auto &snode = create_node(axes, sizes, SNodeType::quant_array, packed, tb);
+                          const DebugInfo &dbg_info) {
+  auto &snode = create_node(axes, sizes, SNodeType::quant_array, dbg_info);
   snode.physical_type =
       TypeFactory::get_instance().get_primitive_int_type(bits, false);
   return snode;
@@ -198,6 +192,10 @@ void SNode::write_int(const std::vector<int> &i, int64 val) {
   snode_rw_accessors_bank_->get(this).write_int(i, val);
 }
 
+void SNode::write_uint(const std::vector<int> &i, uint64 val) {
+  snode_rw_accessors_bank_->get(this).write_uint(i, val);
+}
+
 void SNode::write_float(const std::vector<int> &i, float64 val) {
   snode_rw_accessors_bank_->get(this).write_float(i, val);
 }
@@ -221,8 +219,6 @@ SNode::SNode(int depth,
       snode_rw_accessors_bank_(snode_rw_accessors_bank) {
   id = counter++;
   node_type_name = get_node_type_name();
-  total_num_bits = 0;
-  total_bit_start = 0;
   num_active_indices = 0;
   std::memset(physical_index_position, -1, sizeof(physical_index_position));
   parent = nullptr;
@@ -247,16 +243,6 @@ std::string SNode::get_node_type_name_hinted() const {
   if (is_bit_level)
     suffix += "<bit>";
   return fmt::format("S{}{}{}", id, snode_type_name(type), suffix);
-}
-
-int SNode::get_num_bits(int physical_index) const {
-  int result = 0;
-  const SNode *snode = this;
-  while (snode) {
-    result += snode->extractors[physical_index].num_bits;
-    snode = snode->parent;
-  }
-  return result;
 }
 
 void SNode::print() {
@@ -363,6 +349,13 @@ void SNode::set_snode_tree_id(int id) {
 
 int SNode::get_snode_tree_id() const {
   return snode_tree_id_;
+}
+
+const SNode *SNode::get_root() const {
+  if (!parent) {  // root->parent == nullptr
+    return this;
+  }
+  return parent->get_root();
 }
 
 }  // namespace taichi::lang

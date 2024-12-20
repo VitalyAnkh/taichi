@@ -1,10 +1,13 @@
 #ifdef TI_WITH_VULKAN
 #include "taichi_vulkan_impl.h"
 #include "taichi/rhi/vulkan/vulkan_loader.h"
+#include "taichi/common/utils.h"
 
 #ifdef ANDROID
 #define VK_KHR_android_surface 1
 #include "vulkan/vulkan_android.h"
+#else
+#include "GLFW/glfw3.h"
 #endif  // ANDROID
 
 VulkanRuntime::VulkanRuntime() : GfxRuntime(taichi::Arch::vulkan) {
@@ -26,6 +29,8 @@ VulkanRuntimeImported::Workaround::Workaround(
   taichi::lang::vulkan::VulkanLoader::instance().load_instance(params.instance);
   taichi::lang::vulkan::VulkanLoader::instance().load_device(params.device);
   vk_device.vk_caps().vk_api_version = api_version;
+  // FIXME: (penguinliong) Workaround missing vulkan caps from import.
+  vk_device.vk_caps().external_memory = true;
 
   taichi::lang::DeviceCapabilityConfig caps{};
 
@@ -53,8 +58,7 @@ VulkanRuntimeImported::VulkanRuntimeImported(
     uint32_t api_version,
     const taichi::lang::vulkan::VulkanDevice::Params &params)
     : inner_(api_version, params),
-      gfx_runtime_(taichi::lang::gfx::GfxRuntime::Params{
-          host_result_buffer_.data(), &inner_.vk_device}) {
+      gfx_runtime_(taichi::lang::gfx::GfxRuntime::Params{&inner_.vk_device}) {
 }
 taichi::lang::Device &VulkanRuntimeImported::get() {
   return static_cast<taichi::lang::Device &>(inner_.vk_device);
@@ -100,8 +104,8 @@ VulkanRuntimeOwned::VulkanRuntimeOwned()
 VulkanRuntimeOwned::VulkanRuntimeOwned(
     const taichi::lang::vulkan::VulkanDeviceCreator::Params &params)
     : vk_device_creator_(params),
-      gfx_runtime_(taichi::lang::gfx::GfxRuntime::Params{
-          host_result_buffer_.data(), vk_device_creator_.device()}) {
+      gfx_runtime_(
+          taichi::lang::gfx::GfxRuntime::Params{vk_device_creator_.device()}) {
 }
 taichi::lang::Device &VulkanRuntimeOwned::get() {
   return *static_cast<taichi::lang::Device *>(vk_device_creator_.device());
@@ -124,10 +128,10 @@ void VulkanRuntime::free_image(TiImage image) {
 // -----------------------------------------------------------------------------
 
 TiRuntime ti_create_vulkan_runtime_ext(uint32_t api_version,
-                                       const char **instance_extensions,
                                        uint32_t instance_extension_count,
-                                       const char **device_extensions,
-                                       uint32_t device_extension_count) {
+                                       const char **instance_extensions,
+                                       uint32_t device_extension_count,
+                                       const char **device_extensions) {
   TiRuntime out = TI_NULL_HANDLE;
   TI_CAPI_TRY_CATCH_BEGIN();
   if (api_version < VK_API_VERSION_1_0) {
@@ -155,6 +159,9 @@ TiRuntime ti_create_vulkan_runtime_ext(uint32_t api_version,
     params.additional_device_extensions.push_back(device_extensions[i]);
   }
   params.surface_creator = nullptr;
+  if (is_ci()) {
+    params.enable_validation_layer = true;
+  }
   out = (TiRuntime) static_cast<Runtime *>(new VulkanRuntimeOwned(params));
   TI_CAPI_TRY_CATCH_END();
   return out;
@@ -332,44 +339,6 @@ void ti_export_vulkan_image(TiRuntime runtime,
   interop_info->sample_count = VK_SAMPLE_COUNT_1_BIT;
   interop_info->tiling = VK_IMAGE_TILING_OPTIMAL;
   interop_info->usage = image2->usage;
-  TI_CAPI_TRY_CATCH_END();
-}
-
-TiEvent ti_import_vulkan_event(TiRuntime runtime,
-                               const TiVulkanEventInteropInfo *interop_info) {
-  TiEvent out = TI_NULL_HANDLE;
-  TI_CAPI_TRY_CATCH_BEGIN();
-  TI_CAPI_ARGUMENT_NULL_RV(runtime);
-  TI_CAPI_ARGUMENT_NULL_RV(interop_info);
-  TI_CAPI_ARGUMENT_NULL_RV(interop_info->event);
-  TI_CAPI_INVALID_INTEROP_ARCH_RV(((Runtime *)runtime)->arch, vulkan);
-
-  Runtime *runtime2 = (Runtime *)runtime;
-
-  vkapi::IVkEvent event = std::make_unique<vkapi::DeviceObjVkEvent>();
-  event->device = runtime2->as_vk()->get_vk().vk_device();
-  event->event = interop_info->event;
-  event->external = true;
-
-  std::unique_ptr<taichi::lang::DeviceEvent> event2(
-      new taichi::lang::vulkan::VulkanDeviceEvent(std::move(event)));
-
-  out = (TiEvent) new Event(*runtime2, std::move(event2));
-  TI_CAPI_TRY_CATCH_END();
-  return out;
-}
-void ti_export_vulkan_event(TiRuntime runtime,
-                            TiEvent event,
-                            TiVulkanEventInteropInfo *interop_info) {
-  TI_CAPI_TRY_CATCH_BEGIN();
-  TI_CAPI_ARGUMENT_NULL(runtime);
-  TI_CAPI_ARGUMENT_NULL(event);
-  TI_CAPI_ARGUMENT_NULL(interop_info);
-  TI_CAPI_INVALID_INTEROP_ARCH(((Runtime *)runtime)->arch, vulkan);
-
-  auto event2 =
-      (taichi::lang::vulkan::VulkanDeviceEvent *)(&((Event *)event)->get());
-  interop_info->event = event2->vkapi_ref->event;
   TI_CAPI_TRY_CATCH_END();
 }
 

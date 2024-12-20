@@ -3,22 +3,47 @@ import json
 import re
 from collections import defaultdict
 from pathlib import Path
+from typing import List
+
+
+class Version:
+    def __init__(self, ver: str) -> None:
+        if ver.startswith("v"):
+            ver = ver[1:]
+        xs = [int(x) for x in ver.split(".")]
+        assert len(xs) <= 3
+        xs += ["0"] * (3 - len(xs))
+
+        self.major = xs[0]
+        self.minor = xs[1]
+        self.patch = xs[2]
+
+    def to_int(self) -> int:
+        version_number = 0
+        version_number += self.major
+        version_number *= 1000
+        version_number += self.minor
+        version_number *= 1000
+        version_number += self.patch
+        return version_number
+
+    def __str__(self) -> str:
+        return f"{self.major}.{self.minor}.{self.patch}"
 
 
 class Name:
     def __init__(self, name: str, prefix=[], suffix=[]):
-        assert re.match('^[@a-z0-9_]+$', name)
+        assert re.match("^[@a-z0-9_]+$", name)
         self._segs = name.split("_")
         self._prefix = prefix
         self._suffix = suffix
 
-    def extend(self, subname):
+    def extend(self, subname) -> "Name":
         if isinstance(subname, str):
             subname = Name(subname)
         assert isinstance(subname, Name)
         assert len(subname._prefix) == 0 and len(subname._suffix) == 0
-        return Name('_'.join(self._segs + subname._segs), self._prefix,
-                    self._suffix)
+        return Name("_".join(self._segs + subname._segs), self._prefix, self._suffix)
 
     @property
     def segs(self):
@@ -26,18 +51,18 @@ class Name:
 
     @property
     def snake_case(self) -> str:
-        return '_'.join(self.segs)
+        return "_".join(self.segs)
 
     @property
     def screaming_snake_case(self) -> str:
-        return '_'.join(x.upper() for x in self.segs)
+        return "_".join(x.upper() for x in self.segs)
 
     @property
     def upper_camel_case(self) -> str:
-        return ''.join(x.title() for x in self.segs)
+        return "".join(x.title() for x in self.segs)
 
     def __repr__(self) -> str:
-        return '_'.join(self._segs)
+        return "_".join(self._segs)
 
 
 class DeclarationRegistry:
@@ -49,7 +74,7 @@ class DeclarationRegistry:
         self._imported = {}
         self._builtin_tys = dict((x.id, x) for x in builtin_tys)
 
-    def resolve(self, id: str):
+    def resolve(self, id: str) -> "EntryBase":
         if id in self._builtin_tys:
             return self._builtin_tys[id]
         elif id in self._inner:
@@ -96,6 +121,7 @@ class EntryBase:
         assert "name" in j
         self.vendor = None
         self.is_extension = False
+        self.since = None
 
         prefix = []
         suffix = []
@@ -117,6 +143,9 @@ class EntryBase:
             if version > 1:
                 suffix += [str(version)]
             self.version = version
+
+        if "since" in j:
+            self.since = Version(j["since"])
 
         self.name = Name(j["name"], prefix, suffix)
         self.id = f"{clazz}.{self.name}"
@@ -153,8 +182,7 @@ class Enumeration(EntryBase):
         if "inc_cases" in j:
             self.cases = load_inc_enums()[j["inc_cases"]]
         else:
-            self.cases = dict(
-                (Name(name), value) for name, value in j["cases"].items())
+            self.cases = dict((Name(name), value) for name, value in j["cases"].items())
 
 
 class BitField(EntryBase):
@@ -163,8 +191,7 @@ class BitField(EntryBase):
         if "inc_cases" in j:
             self.bits = load_inc_enums()[j["inc_bits"]]
         else:
-            self.bits = dict(
-                (Name(name), value) for name, value in j["bits"].items())
+            self.bits = dict((Name(name), value) for name, value in j["bits"].items())
 
 
 class Field:
@@ -195,6 +222,21 @@ class Union(EntryBase):
         if "variants" in j:
             for x in j["variants"]:
                 self.variants += [Field(x)]
+
+
+class Callback(EntryBase):
+    def __init__(self, j):
+        super().__init__(j, "callback")
+        self.return_value_type = None
+        self.params = []
+
+        if "parameters" in j:
+            for x in j["parameters"]:
+                field = Field(x)
+                if field.name.snake_case == "@return":
+                    self.return_value_type = field.type
+                else:
+                    self.params += [field]
 
 
 class Function(EntryBase):
@@ -262,8 +304,7 @@ class Documentation:
                 m = re.match(SYM_PATTERN, line)
                 if m:
                     # Remove trailing empty lines.
-                    while api_refs[cur_sym] and len(
-                            api_refs[cur_sym][-1]) == 0:
+                    while api_refs[cur_sym] and len(api_refs[cur_sym][-1]) == 0:
                         del api_refs[cur_sym][-1]
 
                     # Enter parsing for the next symbol.
@@ -293,7 +334,7 @@ class Documentation:
 class Module:
     all_modules = {}
 
-    def __init__(self, version, j, builtin_tys):
+    def __init__(self, version: Version, j: dict, builtin_tys: List[BuiltInType]):
         self.name = j["name"]
         self.is_built_in = False
         self.declr_reg = DeclarationRegistry(builtin_tys)
@@ -306,7 +347,7 @@ class Module:
         if "default_definitions" in j:
             for jj in j["default_definitions"]:
                 name = jj["name"]
-                value = jj["value"] if "value" in jj else str(version)
+                value = jj["value"] if "value" in jj else str(version.to_int())
                 self.default_definitions += [(name, value)]
 
         if "doc" in j:
@@ -343,6 +384,8 @@ class Module:
                         self.declr_reg.register(Structure(k))
                     elif ty == "union":
                         self.declr_reg.register(Union(k))
+                    elif ty == "callback":
+                        self.declr_reg.register(Callback(k))
                     elif ty == "function":
                         self.declr_reg.register(Function(k))
                     else:
@@ -354,21 +397,17 @@ class Module:
 
     @staticmethod
     def load_all(builtin_tys):
-        def ver2int(ver: str) -> int:
-            xs = [int(x) for x in ver.split('.')]
-            assert len(xs) <= 3
-            xs += ['0'] * (3 - len(xs))
-
-            version_number = 0
-            for i in range(3):
-                version_number = version_number * 1000 + xs[i]
-            return version_number
-
         j = None
         with open("c_api/taichi.json") as f:
             j = json.load(f)
 
-        version = ver2int(j["version"])
+        version = Version("v0")
+        try:
+            with open("version.txt") as f:
+                version = Version(f.readline())
+        except:
+            print("faild to load c-api version")
+
         print("taichi c-api version is:", version)
 
         for k in j["modules"]:

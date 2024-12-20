@@ -15,12 +15,34 @@ from taichi.lang.runtime_ops import *
 from taichi.lang.snode import *
 from taichi.lang.source_builder import *
 from taichi.lang.struct import *
+from taichi.lang.argpack import *
 
 __all__ = [
-    s for s in dir() if not s.startswith('_') and s not in [
-        'any_array', 'ast', 'common_ops', 'enums', 'exception', 'expr', 'impl',
-        'inspect', 'kernel_arguments', 'kernel_impl', 'matrix', 'mesh', 'misc',
-        'ops', 'platform', 'runtime_ops', 'shell', 'snode', 'source_builder',
-        'struct', 'util'
+    s
+    for s in dir()
+    if not s.startswith("_")
+    and s
+    not in [
+        "any_array",
+        "ast",
+        "common_ops",
+        "enums",
+        "exception",
+        "expr",
+        "impl",
+        "inspect",
+        "kernel_arguments",
+        "kernel_impl",
+        "matrix",
+        "mesh",
+        "misc",
+        "ops",
+        "platform",
+        "runtime_ops",
+        "shell",
+        "snode",
+        "source_builder",
+        "struct",
+        "util",
     ]
 ]

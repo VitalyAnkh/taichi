@@ -108,7 +108,7 @@ def test_no_duplicate_eval_func():
         return ti.atomic_add(b[None], n)
 
     def foo(n):
-        ast_builder = impl.get_runtime().prog.current_ast_builder()
+        ast_builder = impl.get_runtime().compiling_callable.ast_builder()
         return ti.atomic_add(impl.subscript(ast_builder, b, None), n)
 
     @ti.kernel
@@ -133,8 +133,7 @@ def test_chain_compare():
         b[None] = 2
         c[None] = 3
         d[None] = 3
-        a[0] = c[None] == d[None] != b[None] < d[None] > b[None] >= b[
-            None] <= c[None]
+        a[0] = c[None] == d[None] != b[None] < d[None] > b[None] >= b[None] <= c[None]
         a[1] = b[None] <= c[None] != d[None] > b[None] == b[None]
 
     func()
@@ -160,8 +159,7 @@ def test_static_in():
 
 @test_utils.test()
 def test_non_static_in():
-    with pytest.raises(ti.TaichiCompilationError,
-                       match='"In" is only supported inside `ti.static`.'):
+    with pytest.raises(ti.TaichiCompilationError, match='"In" is only supported inside `ti.static`.'):
 
         @ti.kernel
         def foo(a: ti.template()) -> ti.i32:
@@ -171,34 +169,6 @@ def test_non_static_in():
             return b
 
         foo(ti.i32)
-
-
-@test_utils.test()
-def test_static_is():
-    @ti.kernel
-    def is_f32(tp: ti.template()) -> ti.i32:
-        return ti.static(tp is ti.f32)
-
-    @ti.kernel
-    def is_not_f32(tp: ti.template()) -> ti.i32:
-        return ti.static(tp is not ti.f32)
-
-    assert is_f32(ti.f32) == 1
-    assert is_f32(ti.i32) == 0
-    assert is_not_f32(ti.f32) == 0
-    assert is_not_f32(ti.i32) == 1
-
-
-@test_utils.test()
-def test_non_static_is():
-    with pytest.raises(ti.TaichiCompilationError,
-                       match='"Is" is only supported inside `ti.static`.'):
-
-        @ti.kernel
-        def is_f32(tp: ti.template()) -> ti.i32:
-            return tp is ti.f32
-
-        is_f32(ti.f32)
 
 
 @test_utils.test(default_ip=ti.i64, require=ti.extension.data64)

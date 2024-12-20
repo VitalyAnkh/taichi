@@ -1,4 +1,3 @@
-import warnings
 from typing import Any, Optional, Sequence, Union
 
 from taichi._lib import core as _ti_core
@@ -34,11 +33,13 @@ class FieldsBuilder:
         #  +-- pointer +-- dense +-- place(y)
         fb.finalize()
     """
+
     def __init__(self):
         self.ptr = _snode_registry.create_root(impl.get_runtime().prog)
         self.root = snode.SNode(self.ptr)
         self.finalized = False
         self.empty = True
+        impl.get_runtime().initialize_fields_builder(self)
 
     # TODO: move this into SNodeTree
     @classmethod
@@ -61,24 +62,26 @@ class FieldsBuilder:
         if self.finalized:
             self.root.deactivate_all()
         else:
-            warning(
-                """'deactivate_all()' would do nothing if FieldsBuilder is not finalized"""
-            )
+            warning("""'deactivate_all()' would do nothing if FieldsBuilder is not finalized""")
 
-    def dense(self, indices: Union[Sequence[_Axis], _Axis],
-              dimensions: Union[Sequence[int], int]):
+    def dense(
+        self,
+        indices: Union[Sequence[_Axis], _Axis],
+        dimensions: Union[Sequence[int], int],
+    ):
         """Same as :func:`taichi.lang.snode.SNode.dense`"""
         self._check_not_finalized()
         self.empty = False
         return self.root.dense(indices, dimensions)
 
-    def pointer(self, indices: Union[Sequence[_Axis], _Axis],
-                dimensions: Union[Sequence[int], int]):
+    def pointer(
+        self,
+        indices: Union[Sequence[_Axis], _Axis],
+        dimensions: Union[Sequence[int], int],
+    ):
         """Same as :func:`taichi.lang.snode.SNode.pointer`"""
-        if impl.current_cfg().arch == _ti_core.metal:
-            warnings.warn(
-                "Pointer SNode on metal backend is deprecated, and it will be removed in v1.4.0.",
-                DeprecationWarning)
+        if not _ti_core.is_extension_supported(impl.current_cfg().arch, _ti_core.Extension.sparse):
+            raise TaichiRuntimeError("Pointer SNode is not supported on this backend.")
         self._check_not_finalized()
         self.empty = False
         return self.root.pointer(indices, dimensions)
@@ -87,40 +90,53 @@ class FieldsBuilder:
         """Same as :func:`taichi.lang.snode.SNode.hash`"""
         raise NotImplementedError()
 
-    def dynamic(self,
-                index: Union[Sequence[_Axis], _Axis],
-                dimension: Union[Sequence[int], int],
-                chunk_size: Optional[int] = None):
+    def dynamic(
+        self,
+        index: Union[Sequence[_Axis], _Axis],
+        dimension: Union[Sequence[int], int],
+        chunk_size: Optional[int] = None,
+    ):
         """Same as :func:`taichi.lang.snode.SNode.dynamic`"""
-        if impl.current_cfg().arch == _ti_core.metal:
+        if not _ti_core.is_extension_supported(impl.current_cfg().arch, _ti_core.Extension.sparse):
+            raise TaichiRuntimeError("Dynamic SNode is not supported on this backend.")
+
+        if dimension >= 2**31:
             raise TaichiRuntimeError(
-                "Dynamic SNode on metal backend is deprecated and removed in this release."
+                f"The maximum dimension of a dynamic SNode cannot exceed the maximum value of a 32-bit signed integer: Got {dimension} > 2**31-1"
             )
+        if chunk_size is not None and chunk_size >= 2**31:
+            raise TaichiRuntimeError(
+                f"Chunk size cannot exceed the maximum value of a 32-bit signed integer: Got {chunk_size} > 2**31-1"
+            )
+
         self._check_not_finalized()
         self.empty = False
         return self.root.dynamic(index, dimension, chunk_size)
 
-    def bitmasked(self, indices: Union[Sequence[_Axis], _Axis],
-                  dimensions: Union[Sequence[int], int]):
+    def bitmasked(
+        self,
+        indices: Union[Sequence[_Axis], _Axis],
+        dimensions: Union[Sequence[int], int],
+    ):
         """Same as :func:`taichi.lang.snode.SNode.bitmasked`"""
-        if impl.current_cfg().arch == _ti_core.metal:
-            warnings.warn(
-                "Bitmasked SNode on metal backend is deprecated, and it will be removed in v1.4.0.",
-                DeprecationWarning)
+        if not _ti_core.is_extension_supported(impl.current_cfg().arch, _ti_core.Extension.sparse):
+            raise TaichiRuntimeError("Bitmasked SNode is not supported on this backend.")
         self._check_not_finalized()
         self.empty = False
         return self.root.bitmasked(indices, dimensions)
 
-    def quant_array(self, indices: Union[Sequence[_Axis], _Axis],
-                    dimensions: Union[Sequence[int], int], max_num_bits: int):
+    def quant_array(
+        self,
+        indices: Union[Sequence[_Axis], _Axis],
+        dimensions: Union[Sequence[int], int],
+        max_num_bits: int,
+    ):
         """Same as :func:`taichi.lang.snode.SNode.quant_array`"""
         self._check_not_finalized()
         self.empty = False
         return self.root.quant_array(indices, dimensions, max_num_bits)
 
-    def place(self,
-              *args: Any,
-              offset: Optional[Union[Sequence[int], int]] = None):
+    def place(self, *args: Any, offset: Optional[Union[Sequence[int], int]] = None):
         """Same as :func:`taichi.lang.snode.SNode.place`"""
         self._check_not_finalized()
         self.empty = False
@@ -162,11 +178,9 @@ class FieldsBuilder:
         if self.empty and raise_warning:
             warning("Finalizing an empty FieldsBuilder!")
         self.finalized = True
-        return SNodeTree(
-            _ti_core.finalize_snode_tree(_snode_registry, self.ptr,
-                                         impl.get_runtime().prog,
-                                         compile_only))
+        impl.get_runtime().finalize_fields_builder(self)
+        return SNodeTree(_ti_core.finalize_snode_tree(_snode_registry, self.ptr, impl.get_runtime().prog, compile_only))
 
     def _check_not_finalized(self):
         if self.finalized:
-            raise TaichiRuntimeError('FieldsBuilder finalized')
+            raise TaichiRuntimeError("FieldsBuilder finalized")

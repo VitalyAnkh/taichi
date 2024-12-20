@@ -31,6 +31,7 @@ using pStmt = std::unique_ptr<Stmt>;
 class SNode;
 
 class Kernel;
+class Callable;
 struct CompileConfig;
 
 enum class SNodeAccessFlag : int { block_local, read_only, mesh_local };
@@ -225,8 +226,6 @@ class Load {
 
 class IRNode {
  public:
-  Kernel *kernel;
-
   virtual void accept(IRVisitor *visitor) {
     TI_NOT_IMPLEMENTED
   }
@@ -236,11 +235,9 @@ class IRNode {
   virtual IRNode *get_parent() const = 0;
 
   IRNode *get_ir_root();
-  Kernel *get_kernel() const;
+  const IRNode *get_ir_root() const;
 
   virtual ~IRNode() = default;
-
-  CompileConfig &get_config() const;
 
   template <typename T>
   bool is() const {
@@ -272,10 +269,8 @@ class IRNode {
   std::unique_ptr<IRNode> clone();
 };
 
-#define TI_DEFINE_ACCEPT                     \
-  void accept(IRVisitor *visitor) override { \
-    visitor->visit(this);                    \
-  }
+#define TI_DEFINE_ACCEPT \
+  void accept(IRVisitor *visitor) override { visitor->visit(this); }
 
 #define TI_DEFINE_CLONE                                             \
   std::unique_ptr<Stmt> clone() const override {                    \
@@ -396,6 +391,7 @@ class StmtFieldManager {
 class Stmt : public IRNode {
  protected:
   std::vector<Stmt **> operands;
+  explicit Stmt(const DebugInfo &dbg_info);
 
  public:
   StmtFieldManager field_manager;
@@ -405,8 +401,8 @@ class Stmt : public IRNode {
   Block *parent;
   bool erased;
   bool fields_registered;
-  std::string tb;
   DataType ret_type;
+  DebugInfo dbg_info;
 
   Stmt();
   Stmt(const Stmt &stmt);
@@ -446,6 +442,16 @@ class Stmt : public IRNode {
     return *operands[i];
   }
 
+  std::string get_last_tb() const;
+
+  TI_FORCE_INLINE std::string const &get_tb() const {
+    return dbg_info.tb;
+  }
+
+  TI_FORCE_INLINE void set_tb(const std::string &tb) {
+    dbg_info.tb = tb;
+  }
+
   std::vector<Stmt *> get_operands() const;
 
   void set_operand(int i, Stmt *stmt);
@@ -460,6 +466,7 @@ class Stmt : public IRNode {
   virtual void replace_operand_with(Stmt *old_stmt, Stmt *new_stmt);
 
   IRNode *get_parent() const override;
+  virtual Callable *get_callable() const;
 
   // returns the inserted stmt
   Stmt *insert_before_me(std::unique_ptr<Stmt> &&new_stmt);
@@ -489,10 +496,6 @@ class Stmt : public IRNode {
     return make_typed<T>(std::forward<Args>(args)...);
   }
 
-  void set_tb(const std::string &tb) {
-    this->tb = tb;
-  }
-
   std::string type();
 
   virtual std::unique_ptr<Stmt> clone() const {
@@ -508,7 +511,7 @@ class Stmt : public IRNode {
 
 class Block : public IRNode {
  public:
-  Stmt *parent_stmt{nullptr};
+  std::variant<Stmt *, Callable *> parent_;
   stmt_vector statements;
   stmt_vector trash_bin;
   std::vector<SNode *> stop_gradients;
@@ -517,10 +520,17 @@ class Block : public IRNode {
   // variables, and AllocaStmt for other variables.
   std::map<Identifier, Stmt *> local_var_to_stmt;
 
-  Block() {
-    parent_stmt = nullptr;
-    kernel = nullptr;
+  explicit Block(Callable *callable = nullptr) {
+    parent_ = callable;
   }
+
+  Stmt *parent_stmt() const;
+
+  void set_parent_callable(Callable *callable);
+
+  void set_parent_stmt(Stmt *stmt);
+
+  Callable *parent_callable() const;
 
   Block *parent_block() const;
 
@@ -607,6 +617,19 @@ class DelayedIRModifier {
 
   // Force the next call of modify_ir() to return true.
   void mark_as_modified();
+};
+
+// ImmediateIRModifier aims at replacing Stmt::replace_usages_with, which visits
+// the whole tree for a single replacement. ImmediateIRModifier is currently
+// associated with a pass, visits the whole tree once at the beginning of that
+// pass, and performs a single replacement with amortized constant time.
+class ImmediateIRModifier {
+ private:
+  std::unordered_map<Stmt *, std::vector<std::pair<Stmt *, int>>> stmt_usages_;
+
+ public:
+  explicit ImmediateIRModifier(IRNode *root);
+  void replace_usages_with(Stmt *old_stmt, Stmt *new_stmt);
 };
 
 template <typename T>

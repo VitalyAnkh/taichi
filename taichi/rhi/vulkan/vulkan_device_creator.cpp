@@ -9,6 +9,7 @@
 #include "taichi/rhi/vulkan/vulkan_common.h"
 #include "taichi/rhi/vulkan/vulkan_loader.h"
 #include "taichi/rhi/vulkan/vulkan_device.h"
+#include "taichi/common/utils.h"
 
 namespace taichi::lang {
 namespace vulkan {
@@ -38,17 +39,28 @@ bool check_validation_layer_support() {
   return true;
 }
 
+static const std::unordered_set<std::string> ignored_messages = {
+    "UNASSIGNED-DEBUG-PRINTF",
+    "VUID_Undefined",
+    // (penguinliong): Attempting to map a non-host-visible piece of memory.
+    // `VulkanDevice::map()` returns `RhiResult::invalid_usage` in this case.
+    "VUID-vkMapMemory-memory-00682",
+};
+
+[[maybe_unused]] bool vk_ignore_validation_warning(
+    const std::string &msg_name) {
+  if (ignored_messages.count(msg_name) > 0) {
+    return true;
+  }
+
+  return false;
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL
 vk_debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
                   VkDebugUtilsMessageTypeFlagsEXT message_type,
                   const VkDebugUtilsMessengerCallbackDataEXT *p_callback_data,
                   void *p_user_data) {
-  if (message_severity > VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) {
-    char msg_buf[512];
-    snprintf(msg_buf, sizeof(msg_buf), "Vulkan validation layer: %d, %s",
-             message_type, p_callback_data->pMessage);
-    RHI_LOG_ERROR(msg_buf);
-  }
   if (message_type == VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT &&
       message_severity == VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT &&
       strstr(p_callback_data->pMessage, "DEBUG-PRINTF") != nullptr) {
@@ -57,6 +69,21 @@ vk_debug_callback(VkDebugUtilsMessageSeverityFlagBitsEXT message_severity,
     auto const pos = msg.find_last_of("|");
     std::cout << msg.substr(pos + 2);
   }
+
+  if (message_severity > VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT) {
+    char msg_buf[4096];
+    snprintf(msg_buf, sizeof(msg_buf), "Vulkan validation layer: %d, %s",
+             message_type, p_callback_data->pMessage);
+
+    if (is_ci()) {
+      auto msg_name = std::string(p_callback_data->pMessageIdName);
+      if (!vk_ignore_validation_warning(msg_name))
+        TI_ERROR(msg_buf);
+    } else {
+      RHI_LOG_ERROR(msg_buf);
+    }
+  }
+
   return VK_FALSE;
 }
 
@@ -138,6 +165,11 @@ VulkanQueueFamilyIndices find_queue_families(VkPhysicalDevice device,
       VkBool32 present_support = false;
       vkGetPhysicalDeviceSurfaceSupportKHR(device, i, surface,
                                            &present_support);
+      char msg_buf[128];
+      RHI_DEBUG_SNPRINTF(msg_buf, sizeof(msg_buf),
+                         "Queue %d %s support for presenting", i,
+                         present_support ? "has" : "does NOT have");
+      RHI_LOG_DEBUG(msg_buf);
 
       if (present_support) {
         indices.present_family = i;
@@ -223,10 +255,13 @@ VulkanDeviceCreator::VulkanDeviceCreator(
 
   create_instance(vk_api_version, manual_create);
   setup_debug_messenger();
+  VkSurfaceKHR test_surface = VK_NULL_HANDLE;
   if (params_.is_for_ui) {
-    create_surface();
+    test_surface = params_.surface_creator(instance_);
+    RHI_ASSERT((test_surface != VK_NULL_HANDLE) &&
+               "failed to create window surface!");
   }
-  pick_physical_device();
+  pick_physical_device(test_surface);
   create_logical_device(manual_create);
 
   {
@@ -242,13 +277,14 @@ VulkanDeviceCreator::VulkanDeviceCreator(
         queue_family_indices_.graphics_family.value();
     ti_device_->init_vulkan_structs(params);
   }
+
+  if (params_.is_for_ui) {
+    vkDestroySurfaceKHR(instance_, test_surface, kNoVkAllocCallbacks);
+  }
 }
 
 VulkanDeviceCreator::~VulkanDeviceCreator() {
   ti_device_.reset();
-  if (surface_ != VK_NULL_HANDLE) {
-    vkDestroySurfaceKHR(instance_, surface_, kNoVkAllocCallbacks);
-  }
   if (params_.enable_validation_layer) {
     destroy_debug_utils_messenger_ext(instance_, debug_messenger_,
                                       kNoVkAllocCallbacks);
@@ -307,10 +343,10 @@ void VulkanDeviceCreator::create_instance(uint32_t vk_api_version,
   }
 
   std::unordered_set<std::string> extensions;
-  for (auto ext : get_required_extensions(params_.enable_validation_layer)) {
+  for (auto &ext : get_required_extensions(params_.enable_validation_layer)) {
     extensions.insert(std::string(ext));
   }
-  for (auto ext : params_.additional_instance_extensions) {
+  for (auto &ext : params_.additional_instance_extensions) {
     extensions.insert(std::string(ext));
   }
 
@@ -384,12 +420,7 @@ void VulkanDeviceCreator::setup_debug_messenger() {
       "failed to set up debug messenger");
 }
 
-void VulkanDeviceCreator::create_surface() {
-  surface_ = params_.surface_creator(instance_);
-  RHI_ASSERT(surface_ && "failed to create window surface!");
-}
-
-void VulkanDeviceCreator::pick_physical_device() {
+void VulkanDeviceCreator::pick_physical_device(VkSurfaceKHR test_surface) {
   uint32_t device_count = 0;
   vkEnumeratePhysicalDevices(instance_, &device_count, nullptr);
   RHI_ASSERT(device_count > 0 && "failed to find GPUs with Vulkan support");
@@ -418,7 +449,7 @@ void VulkanDeviceCreator::pick_physical_device() {
                "TI_VISIBLE_DEVICE=%d is not valid, found %d devices available",
                id, device_count);
       RHI_LOG_ERROR(msg_buf);
-    } else if (get_device_score(devices[id], surface_)) {
+    } else if (get_device_score(devices[id], test_surface)) {
       physical_device_ = devices[id];
       has_visible_device = true;
     }
@@ -428,7 +459,7 @@ void VulkanDeviceCreator::pick_physical_device() {
     // could not find a user defined visible device, use the first one suitable
     size_t max_score = 0;
     for (const auto &device : devices) {
-      size_t score = get_device_score(device, surface_);
+      size_t score = get_device_score(device, test_surface);
       if (score > max_score) {
         physical_device_ = device;
         max_score = score;
@@ -438,7 +469,7 @@ void VulkanDeviceCreator::pick_physical_device() {
   RHI_ASSERT(physical_device_ != VK_NULL_HANDLE &&
              "failed to find a suitable GPU");
 
-  queue_family_indices_ = find_queue_families(physical_device_, surface_);
+  queue_family_indices_ = find_queue_families(physical_device_, test_surface);
 }
 
 void VulkanDeviceCreator::create_logical_device(bool manual_create) {
@@ -563,11 +594,17 @@ void VulkanDeviceCreator::create_logical_device(bool manual_create) {
       enabled_extensions.push_back(ext.extensionName);
     } else if (name == VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) {
       enabled_extensions.push_back(ext.extensionName);
+    } else if (name == VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME) {
+      enabled_extensions.push_back(ext.extensionName);
     } else if (name == VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME &&
                params_.enable_validation_layer) {
       // VK_KHR_shader_non_semantic_info isn't supported on molten-vk.
       // Tracking issue: https://github.com/KhronosGroup/MoltenVK/issues/1214
       caps.set(DeviceCapability::spirv_has_non_semantic_info, true);
+      enabled_extensions.push_back(ext.extensionName);
+    } else if (name == VK_KHR_8BIT_STORAGE_EXTENSION_NAME) {
+      enabled_extensions.push_back(ext.extensionName);
+    } else if (name == VK_KHR_16BIT_STORAGE_EXTENSION_NAME) {
       enabled_extensions.push_back(ext.extensionName);
     } else if (std::find(params_.additional_device_extensions.begin(),
                          params_.additional_device_extensions.end(),
@@ -601,12 +638,6 @@ void VulkanDeviceCreator::create_logical_device(bool manual_create) {
   if (device_supported_features.wideLines) {
     device_features.wideLines = true;
     ti_device_->vk_caps().wide_line = true;
-  } else if (params_.is_for_ui) {
-    if (!device_features.wideLines) {
-      RHI_LOG_ERROR(
-          "Taichi GGUI wide lines feature unavailable due to lack of device "
-          "support");
-    }
   }
 
   if (ti_device_->vk_caps().vk_api_version >= VK_API_VERSION_1_1) {
@@ -660,10 +691,21 @@ void VulkanDeviceCreator::create_logical_device(bool manual_create) {
   VkPhysicalDeviceFloat16Int8FeaturesKHR shader_f16_i8_feature{};
   shader_f16_i8_feature.sType =
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT16_INT8_FEATURES_KHR;
+
+  VkPhysicalDevice8BitStorageFeatures shader_8bit_storage_feature{};
+  shader_8bit_storage_feature.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+  VkPhysicalDevice16BitStorageFeatures shader_16bit_storage_feature{};
+  shader_16bit_storage_feature.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+
   VkPhysicalDeviceBufferDeviceAddressFeaturesKHR
       buffer_device_address_feature{};
   buffer_device_address_feature.sType =
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;
+  VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamic_rendering_feature{};
+  dynamic_rendering_feature.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR;
 
   if (ti_device_->vk_caps().physical_device_features2) {
     VkPhysicalDeviceFeatures2KHR features2{};
@@ -751,6 +793,23 @@ void VulkanDeviceCreator::create_logical_device(bool manual_create) {
       pNextEnd = &shader_f16_i8_feature.pNext;
     }
 
+    if (CHECK_VERSION(1, 1) ||
+        CHECK_EXTENSION(VK_KHR_8BIT_STORAGE_EXTENSION_NAME)) {
+      features2.pNext = &shader_8bit_storage_feature;
+      vkGetPhysicalDeviceFeatures2KHR(physical_device_, &features2);
+
+      *pNextEnd = &shader_8bit_storage_feature;
+      pNextEnd = &shader_8bit_storage_feature.pNext;
+    }
+    if (CHECK_VERSION(1, 1) ||
+        CHECK_EXTENSION(VK_KHR_16BIT_STORAGE_EXTENSION_NAME)) {
+      features2.pNext = &shader_16bit_storage_feature;
+      vkGetPhysicalDeviceFeatures2KHR(physical_device_, &features2);
+
+      *pNextEnd = &shader_16bit_storage_feature;
+      pNextEnd = &shader_16bit_storage_feature.pNext;
+    }
+
     // Buffer Device Address
     if (CHECK_VERSION(1, 2) ||
         CHECK_EXTENSION(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME)) {
@@ -771,6 +830,23 @@ void VulkanDeviceCreator::create_logical_device(bool manual_create) {
       *pNextEnd = &buffer_device_address_feature;
       pNextEnd = &buffer_device_address_feature.pNext;
     }
+
+    // Dynamic rendering
+    // TODO: Figure out how to integrate this correctly with ImGui,
+    //       and then figure out the layout & barrier stuff
+    /*
+    if (CHECK_EXTENSION(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME)) {
+      features2.pNext = &dynamic_rendering_feature;
+      vkGetPhysicalDeviceFeatures2KHR(physical_device_, &features2);
+
+      if (dynamic_rendering_feature.dynamicRendering) {
+        ti_device_->vk_caps().dynamic_rendering = true;
+      }
+
+      *pNextEnd = &dynamic_rendering_feature;
+      pNextEnd = &dynamic_rendering_feature.pNext;
+    }
+    */
 
     // TODO: add atomic min/max feature
   }

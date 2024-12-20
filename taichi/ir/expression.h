@@ -15,7 +15,7 @@ class Expression {
   Stmt *stmt;
 
  public:
-  std::string tb;
+  DebugInfo dbg_info;
   std::map<std::string, std::string> attributes;
   DataType ret_type;
 
@@ -41,7 +41,11 @@ class Expression {
     stmt = nullptr;
   }
 
-  virtual void type_check(CompileConfig *config) = 0;
+  explicit Expression(const DebugInfo &dbg_info) : Expression() {
+    this->dbg_info = dbg_info;
+  }
+
+  virtual void type_check(const CompileConfig *config) = 0;
 
   virtual void accept(ExpressionVisitor *visitor) = 0;
 
@@ -58,6 +62,18 @@ class Expression {
 
   Stmt *get_flattened_stmt() const {
     return stmt;
+  }
+
+  std::string get_last_tb() const {
+    return dbg_info.get_last_tb();
+  }
+
+  std::string const &get_tb() const {
+    return dbg_info.tb;
+  }
+
+  void set_tb(std::string const &tb) {
+    dbg_info.tb = tb;
   }
 };
 
@@ -163,9 +179,7 @@ class ExpressionVisitor {
   bool invoke_default_visitor_{false};
 };
 
-#define TI_DEFINE_ACCEPT_FOR_EXPRESSION              \
-  void accept(ExpressionVisitor *visitor) override { \
-    visitor->visit(this);                            \
-  }
+#define TI_DEFINE_ACCEPT_FOR_EXPRESSION \
+  void accept(ExpressionVisitor *visitor) override { visitor->visit(this); }
 
 }  // namespace taichi::lang

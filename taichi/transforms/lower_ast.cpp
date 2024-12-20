@@ -68,17 +68,34 @@ class LowerAST : public IRVisitor {
     auto ident = stmt->ident;
     TI_ASSERT(block->local_var_to_stmt.find(ident) ==
               block->local_var_to_stmt.end());
-    if (stmt->ret_type->is<TensorType>()) {
-      auto tensor_type = stmt->ret_type->cast<TensorType>();
+    auto alloca_type = stmt->ret_type.ptr_removed();
+    if (auto tensor_type = alloca_type->cast<TensorType>()) {
       auto lowered = std::make_unique<AllocaStmt>(
           tensor_type->get_shape(), tensor_type->get_element_type(),
           stmt->is_shared);
       block->local_var_to_stmt.insert(std::make_pair(ident, lowered.get()));
       stmt->parent->replace_with(stmt, std::move(lowered));
     } else {
-      auto lowered = std::make_unique<AllocaStmt>(stmt->ret_type);
+      auto lowered = std::make_unique<AllocaStmt>(alloca_type);
       block->local_var_to_stmt.insert(std::make_pair(ident, lowered.get()));
       stmt->parent->replace_with(stmt, std::move(lowered));
+    }
+  }
+
+  void visit(FrontendFuncCallStmt *stmt) override {
+    Block *block = stmt->parent;
+    std::vector<Stmt *> args;
+    args.reserve(stmt->args.exprs.size());
+    auto fctx = make_flatten_ctx();
+    for (const auto &arg : stmt->args.exprs) {
+      args.push_back(flatten_rvalue(arg, &fctx));
+    }
+    auto lowered = fctx.push_back<FuncCallStmt>(stmt->func, args);
+    stmt->parent->replace_with(stmt, std::move(fctx.stmts));
+    if (const auto &ident = stmt->ident) {
+      TI_ASSERT(block->local_var_to_stmt.find(ident.value()) ==
+                block->local_var_to_stmt.end());
+      block->local_var_to_stmt.insert(std::make_pair(ident.value(), lowered));
     }
   }
 
@@ -124,7 +141,7 @@ class LowerAST : public IRVisitor {
         new_contents.push_back(x);
       }
     }
-    fctx.push_back<PrintStmt>(new_contents);
+    fctx.push_back<PrintStmt>(new_contents, stmt->formats);
     stmt->parent->replace_with(stmt, std::move(fctx.stmts));
   }
 
@@ -232,12 +249,12 @@ class LowerAST : public IRVisitor {
       new_for->mem_access_opt = stmt->mem_access_opt;
       fctx.push_back(std::move(new_for));
     } else if (stmt->external_tensor) {
-      int arg_id = -1;
+      std::vector<int> arg_id;
       std::vector<Stmt *> shape;
       if (stmt->external_tensor.is<ExternalTensorExpression>()) {
         auto tensor = stmt->external_tensor.cast<ExternalTensorExpression>();
         arg_id = tensor->arg_id;
-        for (int i = 0; i < tensor->dim - abs(tensor->element_dim); i++) {
+        for (int i = 0; i < tensor->ndim; i++) {
           shape.push_back(
               fctx.push_back<ExternalTensorShapeAlongAxisStmt>(i, arg_id));
         }
@@ -259,7 +276,7 @@ class LowerAST : public IRVisitor {
       auto &&new_for = std::make_unique<RangeForStmt>(
           begin, end, std::move(stmt->body), stmt->is_bit_vectorized,
           stmt->num_cpu_threads, stmt->block_dim, stmt->strictly_serialized,
-          /*range_hint=*/fmt::format("arg {}", arg_id));
+          /*range_hint=*/fmt::format("arg ({})", fmt::join(arg_id, ", ")));
       VecStatement new_statements;
       Stmt *loop_index =
           new_statements.push_back<LoopIndexStmt>(new_for.get(), 0);
@@ -395,6 +412,20 @@ class LowerAST : public IRVisitor {
     auto fctx = make_flatten_ctx();
     auto expr_stmt = flatten_rvalue(expr, &fctx);
     auto dest_stmt = flatten_lvalue(dest, &fctx);
+
+    // Perform broadcast
+    if (auto dest_tensor_type =
+            dest_stmt->ret_type.ptr_removed()->cast<TensorType>()) {
+      if (expr_stmt->ret_type->is<PrimitiveType>()) {
+        int num_elements = dest_tensor_type->get_num_elements();
+        std::vector<Stmt *> matrix_members(num_elements, expr_stmt);
+
+        auto bcast_expr_stmt = fctx.push_back<MatrixInitStmt>(matrix_members);
+        bcast_expr_stmt->ret_type = dest_tensor_type;
+        expr_stmt = bcast_expr_stmt;
+      }
+    }
+
     if (dest.is<IdExpression>()) {
       fctx.push_back<LocalStoreStmt>(dest_stmt, expr_stmt);
     } else if (dest.is<IndexExpression>()) {
@@ -404,14 +435,12 @@ class LowerAST : public IRVisitor {
       } else {
         fctx.push_back<GlobalStoreStmt>(dest_stmt, expr_stmt);
       }
-    } else if (dest.is<StrideExpression>()) {
-      fctx.push_back<GlobalStoreStmt>(dest_stmt, expr_stmt);
     } else {
       TI_ASSERT(dest.is<ArgLoadExpression>() &&
                 dest.cast<ArgLoadExpression>()->is_ptr);
       fctx.push_back<GlobalStoreStmt>(dest_stmt, expr_stmt);
     }
-    fctx.stmts.back()->set_tb(assign->tb);
+    fctx.stmts.back()->dbg_info = assign->dbg_info;
     assign->parent->replace_with(assign, std::move(fctx.stmts));
   }
 
@@ -430,6 +459,8 @@ class LowerAST : public IRVisitor {
 
     if (stmt->snode->type == SNodeType::dynamic) {
       auto ptr = fctx.push_back<GlobalPtrStmt>(stmt->snode, indices_stmt);
+      ptr->ret_type = stmt->snode->dt;
+      ptr->ret_type.set_is_pointer(true);
       fctx.push_back<SNodeOpStmt>(stmt->op_type, stmt->snode, ptr, val_stmt);
     } else if (stmt->snode->type == SNodeType::pointer ||
                stmt->snode->type == SNodeType::hash ||
@@ -438,6 +469,8 @@ class LowerAST : public IRVisitor {
       TI_ASSERT(SNodeOpStmt::activation_related(stmt->op_type));
       auto ptr =
           fctx.push_back<GlobalPtrStmt>(stmt->snode, indices_stmt, true, true);
+      ptr->ret_type = stmt->snode->dt;
+      ptr->ret_type.set_is_pointer(true);
       fctx.push_back<SNodeOpStmt>(stmt->op_type, stmt->snode, ptr, val_stmt);
     } else {
       TI_ERROR("The {} operation is not supported on {} SNode",
@@ -462,7 +495,8 @@ class LowerAST : public IRVisitor {
     for (int i = 0; i < (int)fargs.size(); ++i) {
       args_stmts[i] = flatten_rvalue(fargs[i], &fctx);
     }
-    fctx.push_back<AssertStmt>(val_stmt, stmt->text, args_stmts);
+    fctx.push_back<AssertStmt>(val_stmt, stmt->text, args_stmts,
+                               stmt->dbg_info);
     stmt->parent->replace_with(stmt, std::move(fctx.stmts));
   }
 
@@ -493,9 +527,11 @@ class LowerAST : public IRVisitor {
           output_statements));
     } else {
       for (auto &s : stmt->args) {
-        TI_ASSERT_INFO(
-            s.is<IdExpression>(),
-            "external func call via bitcode must pass in local variables.")
+        if (!s.is<IdExpression>()) {
+          ErrorEmitter(
+              TaichiSyntaxError(), stmt,
+              "external func call via bitcode must pass in local variables.");
+        }
         arg_statements.push_back(flatten_lvalue(s, &ctx));
       }
       ctx.push_back(std::make_unique<ExternalFuncCallStmt>(
